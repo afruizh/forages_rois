@@ -1,434 +1,383 @@
 import os
 import json
-import shapely
 import math
 import tempfile
-
-import rasterio as rio
-import geopandas as gpd
+from osgeo import gdal, ogr, osr
 import numpy as np
-import pandas as pd
-
-from shapely import geometry
-from shapely.geometry import Polygon
-from rasterio.mask import mask
-from rasterio.enums import Resampling
-
-from concurrent.futures import ProcessPoolExecutor
-
-import pycocotools.coco as coco
-
-from shapely.geometry import box
-
 from datetime import date
 import cv2 as cv
 
-import glob
+# Utility functions
 
-def create_grid_with_raster_reference(raster_path, my_w, my_h, 
-                                      overlap_h=0, overlap_v=0, gdf = None, save_path=None):
-    """
-    Create a grid of rectangular polygons that covers the extent of a GeoDataFrame 
-    (or the raster's extent if gdf is None) with optional horizontal and vertical overlap.
+def check_raster_gdal(input_file):
+    metadata = {}
+    ds = gdal.Open(input_file)
+    if ds is None:
+        raise ValueError(f"Cannot open raster: {input_file}")
+    metadata["width"] = ds.RasterXSize
+    metadata["height"] = ds.RasterYSize
+    metadata["num_bands"] = ds.RasterCount
+    metadata["dtype"] = gdal.GetDataTypeName(ds.GetRasterBand(1).DataType)
+    gt = ds.GetGeoTransform()
+    metadata["spatial_resolution_m"] = abs(gt[1])
+    srs = osr.SpatialReference()
+    srs.ImportFromWkt(ds.GetProjection())
+    metadata["crs_units"] = srs.GetAttrValue("UNIT")
+    return metadata
 
-    Parameters:
-        gdf (GeoDataFrame or None): The input GeoDataFrame whose extent is used.
-        raster_path (str): Path to the reference raster file.
-        my_w (int or float): The desired cell width in pixel units.
-        my_h (int or float): The desired cell height in pixel units.
-        overlap_h (int or float): The horizontal overlap between cells in pixel units (default is 0).
-        overlap_v (int or float): The vertical overlap between cells in pixel units (default is 0).
-        save_path (str or None): Optional file path to save the grid as a shapefile.
-    
-    Returns:
-        grid (GeoDataFrame): A GeoDataFrame containing the grid polygons.
-    """
-    # Open the raster to get the pixel resolution and extent.
-    with rio.open(raster_path) as src:
-        # Pixel resolution: transform.a is pixel width, transform.e (usually negative) is pixel height.
-        pixel_width = src.transform.a
-        pixel_height = -src.transform.e  # take absolute value
-        
-        # Determine the extent: use gdf if provided, otherwise use raster bounds.
-        if gdf is None:
-            minx, miny, maxx, maxy = src.bounds.left, src.bounds.bottom, src.bounds.right, src.bounds.top
-        else:
+# Grid creation using GDAL/OGR
 
-            if type(gdf) == gpd.GeoDataFrame: # if gdf is a GeoDataFrame
-                minx, miny, maxx, maxy = gdf.total_bounds
-            if type(gdf) == str: #if gdf is a path to a shapefile
-                gdf = gpd.read_file(gdf)
-                minx, miny, maxx, maxy = gdf.total_bounds
-
-    # Convert the desired cell dimensions from pixel units to coordinate units.
-    cell_width = my_w * pixel_width
-    cell_height = my_h * pixel_height
-
-    # Convert overlaps from pixel units to coordinate units.
-    overlap_width = overlap_h * pixel_width
-    overlap_height = overlap_v * pixel_height
-
-    # Compute the step sizes for the grid (i.e., how far apart each cell's origin should be).
-    # The step size is the cell size minus the desired overlap.
+def create_grid_with_raster_reference_gdal(raster_path, cell_w, cell_h, overlap_h=0, overlap_v=0, vector_path=None, save_path=None):
+    ds = gdal.Open(raster_path)
+    gt = ds.GetGeoTransform()
+    minx = gt[0]
+    miny = gt[3] + ds.RasterYSize * gt[5]
+    maxx = gt[0] + ds.RasterXSize * gt[1]
+    maxy = gt[3]
+    cell_width = cell_w * abs(gt[1])
+    cell_height = cell_h * abs(gt[5])
+    overlap_width = overlap_h * abs(gt[1])
+    overlap_height = overlap_v * abs(gt[5])
     step_x = cell_width - overlap_width
     step_y = cell_height - overlap_height
-
-    # Validate that the step sizes are positive.
     if step_x <= 0 or step_y <= 0:
-        raise ValueError("Overlap is too large relative to the cell size resulting in non-positive step size.")
-
-    # Generate coordinates for grid cells.
+        raise ValueError("Overlap too large relative to cell size.")
     x_coords = np.arange(minx, maxx, step_x)
     y_coords = np.arange(miny, maxy, step_y)
-
-    grid_cells = []
-    for x in x_coords:
-        for y in y_coords:
-            # Create a rectangular polygon for each grid cell.
-            cell = box(x, y, x + cell_width, y + cell_height)
-            grid_cells.append(cell)
-
-    # Build the GeoDataFrame.
-    grid = gpd.GeoDataFrame({'geometry': grid_cells}, crs=gdf.crs if gdf is not None else src.crs)
-
-    # Optionally save the grid to file if a save_path is provided.
-    if save_path is not None:
-        if not os.path.exists(save_path):
-            grid.to_file(save_path)
+    driver = ogr.GetDriverByName("ESRI Shapefile")
+    if save_path:
+        if os.path.exists(save_path):
+            print(f"File exists: {save_path}")
         else:
-            print("File already exists at the specified path:", save_path)
+            ds_grid = driver.CreateDataSource(save_path)
+            srs = osr.SpatialReference()
+            srs.ImportFromWkt(ds.GetProjection())
+            layer = ds_grid.CreateLayer("grid", srs, ogr.wkbPolygon)
+            for x in x_coords:
+                for y in y_coords:
+                    ring = ogr.Geometry(ogr.wkbLinearRing)
+                    ring.AddPoint(x, y)
+                    ring.AddPoint(x + cell_width, y)
+                    ring.AddPoint(x + cell_width, y + cell_height)
+                    ring.AddPoint(x, y + cell_height)
+                    ring.AddPoint(x, y)
+                    poly = ogr.Geometry(ogr.wkbPolygon)
+                    poly.AddGeometry(ring)
+                    feat = ogr.Feature(layer.GetLayerDefn())
+                    feat.SetGeometry(poly)
+                    layer.CreateFeature(feat)
+                    feat = None
+            ds_grid = None
+    return x_coords, y_coords, cell_width, cell_height
 
-    return grid
-
-def create_tiles_raster(raster_path, gdf, output_dir):
-
-    # Load grid from file or use provided GeoDataFrame.
-    if isinstance(gdf, str):
-        grid = gpd.read_file(gdf)
-    elif isinstance(gdf, gpd.GeoDataFrame):
-        grid = gdf
-    else:
-        raise ValueError("gdf must be a GeoDataFrame or a valid path to a shapefile.")
-
-    # Ensure output directory exists.
-    os.makedirs(output_dir, exist_ok=True)   
-
-    # Open the raster
-    with rio.open(raster_path) as raster:
-
-        for id in range(len(grid)):
-
-            output_filename = os.path.join(output_dir, f"tile_{id}.tif")
-
-            if not os.path.exists(output_filename):
-
-                #vector = self.grid.to_crs(self.raster.crs)
-                vector = grid[id:id+1].to_crs(raster.crs)
-
-                tile, tile_transform = mask(raster, vector.geometry, crop=True)
-                tile_meta = raster.meta.copy()
-
-                tile_meta.update({
-                    "driver":"Gtiff",
-                    "height":tile.shape[1], # height starts with shape[1]
-                    "width":tile.shape[2], # width starts with shape[2]
-                    "transform":tile_transform
-                })
-
-                with rio.open(output_filename, 'w', **tile_meta) as dst:
-                    dst.write(tile)
-
-def process_tile(tile_id, geometry, raster_path, output_dir):
-    """
-    Process an individual tile: clip the raster to the tile geometry,
-    and save the result if it doesn't already exist.
-    """
-    output_filename = os.path.join(output_dir, f"tile_{tile_id}.tif")
-    if os.path.exists(output_filename):
-        return  # Skip if file already exists
-
-    # Open the raster within the worker process
-    with rio.open(raster_path) as raster:
-        tile, tile_transform = mask(raster, [geometry], crop=True)
-        tile_meta = raster.meta.copy()
-        tile_meta.update({
-            "driver": "GTiff",
-            "height": tile.shape[1],
-            "width": tile.shape[2],
-            "transform": tile_transform
-        })
-
-    with rio.open(output_filename, 'w', **tile_meta) as dst:
-        dst.write(tile)
-    return output_filename
-
-def create_tiles_raster_parallel(raster_path, gdf, output_dir, num_workers=4):
-
-    # Load grid from file or use provided GeoDataFrame.
-    if isinstance(gdf, str):
-        grid = gpd.read_file(gdf)
-    elif isinstance(gdf, gpd.GeoDataFrame):
-        grid = gdf
-    else:
-        raise ValueError("gdf must be a GeoDataFrame or a valid path to a shapefile.")
-
-    # Ensure output directory exists.
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Open the raster once to obtain its CRS.
-    with rio.open(raster_path) as raster:
-        raster_crs = raster.crs
-
-    # Reproject the entire grid to the raster's CRS if necessary.
-    if grid.crs != raster_crs:
-        grid = grid.to_crs(raster_crs)
-
-    # Process each tile in parallel.
-    with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        futures = []
-        for tile_id, row in grid.iterrows():
-            geom = row.geometry
-            futures.append(
-                executor.submit(process_tile, tile_id, geom, raster_path, output_dir)
-            )
-        # Optionally, wait for all tasks to finish.
-        for future in futures:
-            future.result()
-
-    print("Tile creation complete.")
-
+# Main class
+class QGIS2COCO:
+    def coords2pos(self, minx, miny, maxx, maxy, coord, pixel_w, pixel_h):
+        width = abs(maxx - minx)
+        height = abs(maxy - miny)
+        x = (coord[0] - minx) / width
+        y = 1.0 - (coord[1] - miny) / height
+        return (x * pixel_w, y * pixel_h)
     
-# def create_tiles_raster(raster_path, gdf, output_dir):
-
-#     if type(gdf) == gpd.GeoDataFrame: # if gdf is a GeoDataFrame
-#         grid = gdf
-#     if type(gdf) == str: #if gdf is a path to a shapefile
-#         grid = gpd.read_file(gdf)        
-
-#     # Open the raster
-#     with rio.open(raster_path) as raster:
-
-#         tiles, tiles_transform = mask(raster, grid.geometry, crop=True)
-#         tile_meta = raster.meta.copy()
-
-#         for id, tile in enumerate(tiles):
-
-#             output_filename = os.path.join(output_dir, f"tile_{id}.tif")
-
-#             if not os.path.exists(output_filename):
-
-#                 print(tile.shape)
-
-#                 new_tile_meta = tile_meta.copy()                
-
-#                 new_tile_meta.update({
-#                     "driver":"Gtiff",
-#                     "height":tile.shape[1], # height starts with shape[1]
-#                     "width":tile.shape[2], # width starts with shape[2]
-#                     "transform":tiles_transform[id]
-#                 })
-
-#                 with rio.open(output_filename, 'w', **new_tile_meta) as dst:
-#                     dst.write(tile)
-
-
-
-"""
-To apply scale factor it is only necessary to do it for the raster file on load
-"""
-
-
-class QGIS2COCO():
-    """This class is used to convert Raster and Vector layers to a coco dataset"""
-
-    def __init__(self, path_raster, path_vector, category="tree", supercategory="tree"
-            ,allow_clipped_annotations = True, allow_no_annotations=True, class_column = [], invalid_class=[]
-            , preffix = 'tile_', crs = "6933", license = None, information = None, contributor = None, license_url = None
-            , output_format = ".tif"
-        ):
-
-        self.path_raster = path_raster # geotiff data
-        self.path_vector = path_vector # a geopandas dataframe
-        
-        self.path_output = None
-        self.path_annotations = None
-        self.path_images = None
-
-        self.raster = None
-        self.vector = None
-
-        self.gdf = None # geopandas dataframe with bounding box of raster file
-
-        self.coco_images = None
-
-        self.temp_file = None
-
-        #self.crs = "4326"
-        #self.crs = "6933" #units in meters
-        self.crs = crs
-
-        # Load files
-        self.load_files()
-
-        self.supercategory = supercategory
+    def __init__(self, path_raster, path_vector, category="tree", supercategory="tree", allow_clipped_annotations=True, allow_no_annotations=True, class_column=[], invalid_class=[], preffix='tile_', crs=None, license=None, information=None, contributor=None, license_url=None, output_format=".tif", progress_callback=None, interruption_check=None):
+        self.path_raster = path_raster
+        self.path_vector = path_vector
         self.category = category
+        self.supercategory = supercategory
         self.allow_clipped_annotations = allow_clipped_annotations
         self.allow_no_annotations = allow_no_annotations
-
         self.class_column = class_column
         self.invalid_class = invalid_class
-
         self.preffix = preffix
-
+        self.crs = crs
         self.license = license
         self.information = information
         self.contributor = contributor
         self.license_url = license_url
-
         self.output_format = output_format
+        self.progress_callback = progress_callback
+        self.interruption_check = interruption_check
+        self.raster_ds = gdal.Open(self.path_raster)
+        self.vector_ds = ogr.Open(self.path_vector)
+        self.grid = None
+        self.coco_images = []
 
-        #return
-    
     def set_path_output(self, path_output):
-
         self.path_output = path_output
         self.path_annotations = os.path.join(self.path_output, 'annotations')
-        self.path_images = os.path.join(self.path_output, 'images')
+        self.path_images = os.path.join(self.path_output, 'images', 'default')
 
     def create_output_folders(self):
+        os.makedirs(self.path_output, exist_ok=True)
+        os.makedirs(self.path_annotations, exist_ok=True)
+        os.makedirs(self.path_images, exist_ok=True)
 
-        # Create main path
-        if not os.path.exists(self.path_output):
-            os.makedirs(self.path_output)
+    def create_grid(self, cell_w, cell_h, overlap_h=0, overlap_v=0, save_path=None):
+        ds = gdal.Open(self.path_raster)
+        gt = ds.GetGeoTransform()
+        srs = osr.SpatialReference()
+        srs.ImportFromWkt(ds.GetProjection())
+        minx = gt[0]
+        miny = gt[3] + ds.RasterYSize * gt[5]
+        maxx = gt[0] + ds.RasterXSize * gt[1]
+        maxy = gt[3]
+        cell_width = cell_w * abs(gt[1])
+        cell_height = cell_h * abs(gt[5])
+        overlap_width = overlap_h * abs(gt[1])
+        overlap_height = overlap_v * abs(gt[5])
+        step_x = cell_width - overlap_width
+        step_y = cell_height - overlap_height
+        if step_x <= 0 or step_y <= 0:
+            raise ValueError("Overlap too large relative to cell size.")
+        x_coords = np.arange(minx, maxx, step_x)
+        y_coords = np.arange(miny, maxy, step_y)
+        # Create in-memory vector layer for grid
+        mem_driver = ogr.GetDriverByName("Memory")
+        mem_ds = mem_driver.CreateDataSource("grid_mem")
+        grid_layer = mem_ds.CreateLayer("grid", srs, ogr.wkbPolygon)
+        grid_layer.CreateField(ogr.FieldDefn("id", ogr.OFTInteger))
+        feature_id = 0
+        for x in x_coords:
+            for y in y_coords:
+                ring = ogr.Geometry(ogr.wkbLinearRing)
+                ring.AddPoint(x, y)
+                ring.AddPoint(x + cell_width, y)
+                ring.AddPoint(x + cell_width, y + cell_height)
+                ring.AddPoint(x, y + cell_height)
+                ring.AddPoint(x, y)
+                poly = ogr.Geometry(ogr.wkbPolygon)
+                poly.AddGeometry(ring)
+                feat = ogr.Feature(grid_layer.GetLayerDefn())
+                feat.SetGeometry(poly)
+                feat.SetField("id", feature_id)
+                grid_layer.CreateFeature(feat)
+                feat = None
+                feature_id += 1
+        self.grid_layer = grid_layer
+        self.grid_mem_ds = mem_ds
+        self.x_coords = x_coords
+        self.y_coords = y_coords
+        self.cell_width = cell_width
+        self.cell_height = cell_height
+        # Optionally save to shapefile
+        if save_path:
+            shp_driver = ogr.GetDriverByName("ESRI Shapefile")
+            if os.path.exists(save_path):
+                print(f"File exists: {save_path}")
+            else:
+                shp_ds = shp_driver.CreateDataSource(save_path)
+                shp_layer = shp_ds.CreateLayer("grid", srs, ogr.wkbPolygon)
+                shp_layer.CreateField(ogr.FieldDefn("id", ogr.OFTInteger))
+                for feat in self.grid_layer:
+                    new_feat = ogr.Feature(shp_layer.GetLayerDefn())
+                    new_feat.SetGeometry(feat.GetGeometryRef().Clone())
+                    new_feat.SetField("id", feat.GetField("id"))
+                    shp_layer.CreateFeature(new_feat)
+                    new_feat = None
+                shp_ds = None
 
-        # Create annotations path
-        if not os.path.exists(self.path_annotations):
-            os.makedirs(self.path_annotations)
-
-        # Create images path
-        if not os.path.exists(self.path_images):
-            os.makedirs(self.path_images)    
-
-        return
-    
-    def resample_raster(self, scale = 1.0):
-
-        print("resample_raster")
-
-        dataset = self.raster
-
-        print(dataset.profile)
-
-        # resample data to target shape
-        data = dataset.read(
-            out_shape=(
-                dataset.count,
-                int(dataset.height * scale),
-                int(dataset.width * scale)
-            ),
-            resampling=Resampling.bilinear
-        )
-
-        # scale image transform
-        transform = dataset.transform * dataset.transform.scale(
-            (dataset.width / data.shape[-1]),
-            (dataset.height / data.shape[-2])
-        )
-
-        new_meta = self.raster.meta.copy()
-
-        new_meta.update({
-            "driver":"Gtiff",
-            "height":data.shape[-2], # height starts with shape[1]
-            "width":data.shape[-1], # width starts with shape[2]
-            "transform":transform
-        })
-
-        #temp_dir = tempfile.gettempdir()
-        #temp_file_path = os.path.join(temp_dir, "resampled_raster.tif")
-
-        self.temp_file = tempfile.TemporaryFile()
-        self.temp_file.open
-        print(self.temp_file)
-
-        # When done, make sure to remove the temporary file to avoid clutter:
-        # if os.path.exists(temp_file_path):
-        #     os.remove(temp_file_path)
-
-        with rio.open(self.temp_file.name, "w", **new_meta) as dst:
-            dst.write(data) 
-
-        self.raster = rio.open(self.temp_file.name)
-
-    
-    def load_files(self):
-
-        self.raster = rio.open(self.path_raster)
-        self.vector = gpd.read_file(self.path_vector)
-        self.vector = self.vector.to_crs(epsg=self.crs)
-
-        #Create bounding box
-        image_geo = self.raster
-        bb = [(image_geo.bounds[0], image_geo.bounds[3])
-                ,(image_geo.bounds[2], image_geo.bounds[3])
-                ,(image_geo.bounds[2], image_geo.bounds[1])
-                ,(image_geo.bounds[0], image_geo.bounds[1])]
-
-        self.gdf = gpd.GeoDataFrame(geometry=[shapely.geometry.Polygon(bb)])
-        #self.gdf = self.gdf.set_crs(epsg="3857")
-        self.gdf = self.gdf.set_crs(self.raster.crs)
-        self.gdf = self.gdf.to_crs(epsg=self.crs)
-
-        return
-
-    def extract_tiles(self, scale = 1.0):
-
-        #size = 256
-
-        #splitImageIntoCells(self.raster, self.path_images, size)
-
-        coco_images = []
-
-        for i, grid_element in enumerate(self.grid.geometry):
-            basename = self.preffix + str(i) + self.output_format
+    def extract_tiles(self):
+        raster_xsize = self.raster_ds.RasterXSize
+        raster_ysize = self.raster_ds.RasterYSize
+        nodata = self.raster_ds.GetRasterBand(1).GetNoDataValue()
+        if nodata is None:
+            nodata = 0
+        total = len(self.grid_layer)
+        for i, feat in enumerate(self.grid_layer):
+            if self.interruption_check and self.interruption_check():
+                print("Tile extraction interrupted by user")
+                break
+            if self.progress_callback:
+                progress = (i + 1) / total if total else 1.0
+                self.progress_callback({
+                    "count": i + 1,
+                    "total": total,
+                    "progress": progress,
+                    "status": "processing",
+                    "logs": f"Creating tiles... {i + 1}/{total}"
+                })
+            geom = feat.GetGeometryRef()
+            minx, maxx, miny, maxy = geom.GetEnvelope()[0], geom.GetEnvelope()[1], geom.GetEnvelope()[2], geom.GetEnvelope()[3]
+            gt = self.raster_ds.GetGeoTransform()
+            px = int(round((minx - gt[0]) / gt[1]))
+            py = int(round((maxy - gt[3]) / gt[5]))
+            win_w = int(round((maxx - minx) / abs(gt[1])))
+            win_h = int(round((maxy - miny) / abs(gt[5])))
+            basename = f"{self.preffix}{i:05d}{self.output_format}"
             filename = os.path.join(self.path_images, basename)
+            # Calculate intersection with raster bounds
+            read_px = max(px, 0)
+            read_py = max(py, 0)
+            read_w = min(win_w, raster_xsize - read_px)
+            read_h = min(win_h, raster_ysize - read_py)
+            bands = self.raster_ds.RasterCount
+            arr = None
+            arr_dtype = np.float32
+            if read_w > 0 and read_h > 0:
+                arr = self.raster_ds.ReadAsArray(read_px, read_py, read_w, read_h)
+                arr_dtype = arr.dtype
+            out_arr = np.full((bands, win_h, win_w), nodata, dtype=arr_dtype)
+            # Calculate safe assignment sizes
+            if arr is not None:
+                arr_bands = bands if arr.ndim == 3 else 1
+                arr_h = arr.shape[-2] if arr.ndim == 3 else arr.shape[0]
+                arr_w = arr.shape[-1] if arr.ndim == 3 else arr.shape[1]
+                # Calculate offsets for assignment
+                x_off = read_px - px if px < 0 else 0
+                y_off = read_py - py if py < 0 else 0
+                dest_h = min(arr_h, win_h - y_off)
+                dest_w = min(arr_w, win_w - x_off)
+                if arr_bands == 1 and arr.ndim == 2:
+                    out_arr[0, y_off:y_off+dest_h, x_off:x_off+dest_w] = arr[:dest_h, :dest_w]
+                else:
+                    out_arr[:arr_bands, y_off:y_off+dest_h, x_off:x_off+dest_w] = arr[:arr_bands, :dest_h, :dest_w]
+            driver = gdal.GetDriverByName("GTiff")
+            out_ds = driver.Create(filename, win_w, win_h, bands, self.raster_ds.GetRasterBand(1).DataType)
+            for b in range(bands):
+                out_ds.GetRasterBand(b+1).WriteArray(out_arr[b])
+                out_ds.GetRasterBand(b+1).SetNoDataValue(nodata)
+            out_gt = list(gt)
+            out_gt[0] = minx
+            out_gt[3] = maxy
+            out_ds.SetGeoTransform(tuple(out_gt))
+            out_ds.SetProjection(self.raster_ds.GetProjection())
+            out_ds.FlushCache()
+            out_ds = None
+            self.coco_images.append({"id": i + 1, "file_name": basename, "width": win_w, "height": win_h})
 
-            tile, w, h = self.clip_raster(i, filename)
-            
-
-            coco_images.append({
-                "id": i+1
-                , "file_name": basename
-                , "width": w
-                , "height": h
-            })   
-
-        self.coco_images = coco_images 
-
-        return
-    
-    def coords2pos(self, tile_grid, coord, pixel_w, pixel_h):
-
- 
-        xmin, ymin, xmax, ymax = tile_grid.total_bounds
-
-        width = abs(xmax - xmin)
-        height = abs(ymax - ymin)
-
-        x = (coord[0] - xmin)/width
-        y = 1.0 - (coord[1] - ymin)/height
-
-        #res = (round(x*pixel_w, 2),round(y*pixel_h, 2))
-
-        return (x*pixel_w, y*pixel_h)
+    def clip_raster(self, x, y, filename):
+        ds = self.raster_ds
+        gt = ds.GetGeoTransform()
+        px = int((x - gt[0]) / gt[1])
+        py = int((y - gt[3]) / gt[5])
+        win_x = px
+        win_y = py
+        win_w = int(self.cell_width / abs(gt[1]))
+        win_h = int(self.cell_height / abs(gt[5]))
+        arr = ds.ReadAsArray(win_x, win_y, win_w, win_h)
+        driver = gdal.GetDriverByName("GTiff")
+        out_ds = driver.Create(filename, win_w, win_h, ds.RasterCount, ds.GetRasterBand(1).DataType)
+        for b in range(ds.RasterCount):
+            out_ds.GetRasterBand(b+1).WriteArray(arr[b])
+        out_gt = list(gt)
+        out_gt[0] = x
+        out_gt[3] = y
+        out_ds.SetGeoTransform(tuple(out_gt))
+        out_ds.SetProjection(ds.GetProjection())
+        out_ds.FlushCache()
+        out_ds = None
 
     def extract_annotations(self):
+        # Generate COCO-style annotations by intersecting vector features with grid tiles
+        annotations = []
+        ann_count = 1
+        category_id = 1
+        vector_layer = self.vector_ds.GetLayer()
+        grid_srs = self.grid_layer.GetSpatialRef()
+        vector_srs = vector_layer.GetSpatialRef()
+        # If CRS do not match, reproject vector layer to grid CRS (default WGS84)
+        if not grid_srs.IsSame(vector_srs):
+            target_srs = grid_srs if grid_srs else osr.SpatialReference()
+            if not grid_srs:
+                target_srs.ImportFromEPSG(4326)  # WGS84
+            mem_driver = ogr.GetDriverByName("Memory")
+            mem_ds = mem_driver.CreateDataSource("vector_mem")
+            reprojected_layer = mem_ds.CreateLayer("vector_reprojected", target_srs, geom_type=vector_layer.GetGeomType())
+            # Copy fields
+            for i in range(vector_layer.GetLayerDefn().GetFieldCount()):
+                field_defn = vector_layer.GetLayerDefn().GetFieldDefn(i)
+                reprojected_layer.CreateField(field_defn)
+            coord_transform = osr.CoordinateTransformation(vector_srs, target_srs)
+            for feat in vector_layer:
+                geom = feat.GetGeometryRef()
+                geom_clone = geom.Clone()
+                geom_clone.Transform(coord_transform)
+                new_feat = ogr.Feature(reprojected_layer.GetLayerDefn())
+                new_feat.SetGeometry(geom_clone)
+                for i in range(feat.GetFieldCount()):
+                    new_feat.SetField(i, feat.GetField(i))
+                reprojected_layer.CreateFeature(new_feat)
+                new_feat = None
+            vector_layer = reprojected_layer
+        total = len(self.coco_images)
+        for idx, image_info in enumerate(self.coco_images):
+            if self.interruption_check and self.interruption_check():
+                print("Annotation extraction interrupted by user")
+                break
+            if self.progress_callback:
+                progress = (idx + 1) / total if total else 1.0
+                self.progress_callback({
+                    "count": idx + 1,
+                    "total": total,
+                    "progress": progress,
+                    "status": "processing",
+                    "logs": f"Extracting annotations... {idx + 1}/{total}"
+                })
+            image_id = image_info['id']
+            # Find corresponding grid feature
+            grid_feat = self.grid_layer.GetFeature(image_id - 1)
+            grid_geom = grid_feat.GetGeometryRef()
+            env = grid_geom.GetEnvelope()
+            minx, maxx, miny, maxy = env[0], env[1], env[2], env[3]
+            pixel_w = image_info['width']
+            pixel_h = image_info['height']
+            # Clip vector features to grid tile
+            vector_layer.SetSpatialFilter(grid_geom)
+            for vfeat in vector_layer:
+                vgeom = vfeat.GetGeometryRef()
+                # Intersect geometry with grid tile
+                intersection = vgeom.Intersection(grid_geom)
+                if intersection is not None and not intersection.IsEmpty():
+                    geom_type = intersection.GetGeometryType()
+                    # Handle Polygon and MultiPolygon, including 2.5D (Z) types
+                    rings = []
+                    if geom_type in (ogr.wkbPolygon, ogr.wkbPolygon25D):
+                        rings = [intersection.GetGeometryRef(0)]
+                    elif geom_type in (ogr.wkbMultiPolygon, ogr.wkbMultiPolygon25D):
+                        for i in range(intersection.GetGeometryCount()):
+                            poly = intersection.GetGeometryRef(i)
+                            if poly.GetGeometryType() in (ogr.wkbPolygon, ogr.wkbPolygon25D):
+                                rings.append(poly.GetGeometryRef(0))
+                    for ring in rings:
+                        coords = ring.GetPoints()
+                        segmentation = []
+                        for pt in coords:
+                            x, y = pt[:2]
+                            px, py = self.coords2pos(minx, miny, maxx, maxy, (x, y), pixel_w, pixel_h)
+                            segmentation.append(px)
+                            segmentation.append(py)
+                        env_xmin, env_xmax, env_ymin, env_ymax = intersection.GetEnvelope()[0], intersection.GetEnvelope()[1], intersection.GetEnvelope()[2], intersection.GetEnvelope()[3]
+                        pxmin, pymin = self.coords2pos(minx, miny, maxx, maxy, (env_xmin, env_ymin), pixel_w, pixel_h)
+                        pxmax, pymax = self.coords2pos(minx, miny, maxx, maxy, (env_xmax, env_ymax), pixel_w, pixel_h)
+                        w = abs(pxmax - pxmin)
+                        h = abs(pymax - pymin)
+                        bbox = [pxmin, pymax, w, h]
+                        ann = {
+                            "id": ann_count,
+                            "image_id": image_id,
+                            "category_id": category_id,
+                            "segmentation": [segmentation],
+                            "bbox": bbox,
+                            "iscrowd": 0
+                        }
+                        annotations.append(ann)
+                        ann_count += 1
+            vector_layer.SetSpatialFilter(None)
+
+        self.coco_annotations = annotations
+
+    def convert(self, path_output, cell_w, cell_h, overlap_h=0, overlap_v=0):
+        self.set_path_output(path_output)
+        self.create_output_folders()
+        self.create_grid(cell_w, cell_h, overlap_h, overlap_v)
+        self.extract_tiles()
+        self.extract_annotations()
 
         # Create coco dataset
+        import pycocotools.coco as coco
         coco_dataset = coco.COCO()
 
         # Add license and information if any
-        #if self.license is not None:
         # Update license information
         coco_dataset.dataset['licenses'] = [
             {
@@ -448,494 +397,14 @@ class QGIS2COCO():
                 "year": str(date.today().year)
             }
 
-
-
-        # #image_paths = ["D:/local_mydata/ROI/results/coco_dataset/images/tile_5.tif"] #list of paths of the images
-        # image_paths = []
-        # for i, polygon in enumerate(self.grid.geometry):
-        #     name = self.preffix + str(i) + self.output_format
-        #     filename = os.path.join(self.path_images, name)
-        #     image_paths.append(filename)
-
-        # # Add images
-        # images = []
-        # for i, image_path in enumerate(image_paths):
-        #     basename = os.path.basename(image_path)
-        #     images.append({
-        #         "id": i+1
-        #         , "file_name": basename
-        #         , "width": width
-        #         , "height": height
-        #     })
-        # coco_dataset.dataset["images"] = images
-
         coco_dataset.dataset["images"] = self.coco_images
-
-
-        # Add annotations
-        annotations = []
-        ann_count = 1
-
-
-        width = 0
-        height = 0
-        image_index = 0
-
-
-        for item in self.coco_images:
-
-            #print(item)
-
-            image_id = int(item['id'])
-            category_id = 1 # TODO:  update how it is established
-            tile_grid = self.grid[image_id-1:image_id]
-            tile_vector = self.clip_vector(tile_grid)
-            
-
-            # Can be variable??
-            if image_index == 0:
-                width = item['width']
-                height = item['height']
-                image_index = -1
-
-                #print("EXTRACTION", width, height)
-
-            
-
-            for index, polygon in enumerate(tile_vector.geometry):
-
-                # Check polygon valid for class
-                row = tile_vector.iloc[index]
-
-                valid = True
-                for col in self.class_column:
-                    if not col in tile_vector.columns:
-                        continue
-                    annotated_class = str(row[col])
-                    if (annotated_class in self.invalid_class):
-                        valid = False
-                        break
-
-                if not valid:
-                    continue
-                elif isinstance(polygon, shapely.geometry.polygon.Polygon):
-
-                    # Polygon
-                    #print(polygon)
-                    #print(type(polygon))
-                    polygon_coords = []
-
-                    for coord0 in polygon.exterior.coords:
-                        
-                        #coord = transform*coord0
-
-                        coord = self.coords2pos(tile_grid, coord0, width, height)
-                        
-                        x = coord[0]
-                        y = coord[1]
-                        #print(x)
-                        #print(y)
-                        polygon_coords.append(x)
-                        polygon_coords.append(y)
-
-                    # Bounding box
-                    xmin, ymin, xmax, ymax =  polygon.bounds
-                    xmin, ymin = self.coords2pos(tile_grid, (xmin,ymin), width, height)
-                    xmax, ymax = self.coords2pos(tile_grid, (xmax,ymax), width, height)
-
-                    w = abs(xmax - xmin)
-                    h = abs(ymax - ymin)
-
-                    bbox = [xmin, ymax, w, h]
-
-                    # Create COCO annotation
-                    ann = {
-                        "id":ann_count,
-                        "image_id": image_id,
-                        "category_id": category_id,
-                        "segmentation": [polygon_coords],
-                        #"area": mask.sum().item(),
-                        "bbox": bbox,
-                        #"score": score,
-                        "iscrowd":0
-                    }
-                    ann_count = ann_count+1
-
-                    annotations.append(ann)
-                else:
-                    print("INSTANCE", type(polygon))
-
-        
-        coco_dataset.dataset["annotations"] = annotations
-
-        # Define categories (if not already defined in your annotations)
+        coco_dataset.dataset["annotations"] = self.coco_annotations
         categories = [
             {"id": 1, "name": self.category, "supercategory": self.supercategory},
-            # ... add more categories
         ]
         coco_dataset.dataset["categories"] = categories
 
-        # Save the COCO dataset as a JSON file
-        #file_annotations = os.path.join(self.path_annotations,"annotations.json" )
-        file_annotations = os.path.join(self.path_annotations,"instances_.json" )
-        #coco_dataset.save(file_annotations)
+        file_annotations = os.path.join(self.path_annotations,"instances_default.json" )
 
         with open(file_annotations, "w") as f:
             json.dump(coco_dataset.dataset, f, indent=4)
-
-        return
-    
-
-    def get_tile_extent(self, rows, scale):
-
-        cols = rows
-
-        # Get original dimensions
-        w_raster = self.raster.width
-        h_raster = self.raster.height
-
-        width_in_meters = abs(self.raster.bounds.right - self.raster.bounds.left)
-        height_in_meters = abs(self.raster.bounds.top - self.raster.bounds.bottom)
-
-        # 
-        w_tile = math.floor(w_raster/rows)
-        h_tile = math.floor(h_raster/cols)
-
-
-    # def create_grid(self, rows0):
-
-    #     cols0 = rows0
-
-    #     xmin, ymin, xmax, ymax = self.gdf.total_bounds
-
-    #     tile_h = abs(ymax - ymin)/rows0
-    #     tile_w = abs(xmax - xmin)/cols0
-
-    #     cols = list(np.arange(xmin, xmax, tile_w))
-    #     rows = list(np.arange(ymax, ymin, - tile_h))
-
-    #     df_grid = pd.DataFrame()
-
-    #     polygons = []
-    #     count = 0
-         
-    #     for y in rows:
-    #         for x in cols:
-                       
-    #             polygons.append(Polygon([(x,y), (x+tile_w, y), (x+tile_w, y- tile_h), (x, y- tile_h)]))
-
-    #             df_item = pd.DataFrame({'id': count}, index=[count])
-    #             df_grid = pd.concat((df_grid, df_item))
-
-    #             count = count + 1
-
-    #     #self.grid = gpd.GeoDataFrame(df_item, {'geometry':polygons})
-    #     self.grid = gpd.GeoDataFrame(df_grid, geometry=polygons)
-
-    #     # Fix index error with "module 'pandas' has no attribute 'Int64Index'"
-    #     self.grid.reset_index(drop=True, inplace=True)
-    #     self.grid.set_index("id", inplace = True)
-
-    #     #self.grid["row_id"] = self.grid.index + 1
-    #     #self.grid.reset_index(drop=True, inplace=True)
-    #     #self.grid.set_index("row_id", inplace = True)
-
-    #     self.grid = self.grid.set_crs(epsg=self.crs, allow_override=True)
-    #     #grid.to_file("grid.shp")
-
-    def create_grid(self, rows0, w_overlap=0, h_overlap=0):
-
-        cols0 = rows0
-
-        xmin, ymin, xmax, ymax = self.gdf.total_bounds
-
-        Dh = abs(ymax - ymin)
-        # oh = Dh*h_overlap
-        # tile_h = (Dh - oh)/rows0 + oh
-
-        tile_h = Dh/(rows0-rows0*h_overlap+h_overlap)
-        oh = tile_h*h_overlap
-
-        Dw = abs(xmax - xmin)
-        # ow = Dw*w_overlap
-        # tile_w = (Dw - ow)/cols0 + ow
-
-        tile_w = Dw/(cols0-cols0*w_overlap+w_overlap)
-        ow = tile_w*w_overlap
-
-
-        # # Use only the value for the max 
-        # if Dw > Dh and Dh/Dw > 0.7:
-        #     tile_h = tile_w
-        #     oh = ow
-        # elif Dh > Dw and Dw/Dh > 0.7:
-        #     tile_w = tile_h
-        #     ow = oh
-
-        # # Use only the value for the max 
-        if Dw > Dh:
-            tile_h = tile_w
-            oh = ow
-        elif Dh > Dw:
-            tile_w = tile_h
-            ow = oh
-
-        #tile_h = abs(ymax - ymin)/rows0
-        #tile_w = abs(xmax - xmin)/cols0
-
-        #cols = list(np.arange(xmin, xmax, tile_w))
-        #rows = list(np.arange(ymax, ymin, - tile_h))
-
-        #print("TILE SIZE")
-        #print(tile_h)
-        #print(tile_w)
-
-        cols = list(np.arange(xmin, xmax-(ow), tile_w - ow))
-        rows = list(np.arange(ymax, ymin-(-(oh)), - (tile_h-oh)))
-
-        #print(cols)
-        #print(rows)
-
-        df_grid = pd.DataFrame()
-
-        polygons = []
-        count = 0
-         
-        for y in rows:
-            for x in cols:
-
-                poly = Polygon([(x,y), (x+tile_w, y), (x+tile_w, y- tile_h), (x, y- tile_h)])
-
-
-                #Check if polygon covers any annotation
-                if not self.allow_no_annotations:
-
-                    covered_items = []
-                    for index, geom in enumerate(self.vector.geometry):
-                        # print(poly)
-                        # print(geom)
-                        # print(index)
-                        # print(poly.covers(geom))
-                        if poly.covers(geom):
-                            covered_items.append(geom)
-
-                    #print(poly.covers(self.gdf.geometry))
-
-                    if len(covered_items) == 0:
-                        #print("No items are covered by the polygon.")
-                        continue
-                    #else:
-                    #    print(f"{len(covered_items)} items")
-
-
-                polygons.append(poly)
-
-                df_item = pd.DataFrame({'id': count}, index=[count])
-                df_grid = pd.concat((df_grid, df_item))
-
-                count = count + 1
-
-        #self.grid = gpd.GeoDataFrame(df_item, {'geometry':polygons})
-        self.grid = gpd.GeoDataFrame(df_grid, geometry=polygons)
-
-        # Fix index error with "module 'pandas' has no attribute 'Int64Index'"
-        self.grid.reset_index(drop=True, inplace=True)
-        self.grid.set_index("id", inplace = True)
-
-        #self.grid["row_id"] = self.grid.index + 1
-        #self.grid.reset_index(drop=True, inplace=True)
-        #self.grid.set_index("row_id", inplace = True)
-
-        self.grid = self.grid.set_crs(epsg=self.crs, allow_override=True)
-        #grid.to_file("grid.shp")
-
-    # def create_grid(self, rows0, h_overlap=0, v_overlap=0):
-    #     """
-    #     Create a geospatial grid with overlapping tiles.
-        
-    #     Parameters:
-    #     rows0: int
-    #         Number of rows (and columns) for the grid.
-    #     h_overlap: float, optional
-    #         Horizontal overlap distance (in the same units as the CRS). 
-    #         (For a raster, convert pixel overlap to map units using pixel resolution.)
-    #     v_overlap: float, optional
-    #         Vertical overlap distance (in the same units as the CRS).
-    #     """
-    #     # Define grid dimensions (square grid)
-    #     cols0 = rows0
-
-    #     # Get total bounds of the input GeoDataFrame
-    #     xmin, ymin, xmax, ymax = self.gdf.total_bounds
-
-    #     # Compute the nominal tile width and height (without overlap)
-    #     tile_w = abs(xmax - xmin) / cols0
-    #     tile_h = abs(ymax - ymin) / rows0
-
-    #     # Calculate the step sizes (distance between the origins of adjacent tiles)
-    #     # With a non-zero overlap, the step is smaller than the tile size.
-    #     step_x = tile_w - tile_w*h_overlap
-    #     step_y = tile_h - tile_h*v_overlap
-
-    #     print(tile_w, h_overlap)
-    #     print(tile_h, v_overlap)
-
-    #     if step_x <= 0 or step_y <= 0:
-    #         raise ValueError("Overlap is too large compared to the tile size.")
-
-    #     # Generate the coordinates for the grid origins.
-    #     # Note: np.arange might not include the very last cell if the bounds are not an exact multiple.
-    #     cols = np.arange(xmin, xmax, step_x)
-    #     rows = np.arange(ymax, ymin, -step_y)
-
-    #     df_grid = pd.DataFrame()
-    #     polygons = []
-    #     count = 0
-
-    #     for y in rows:
-    #         for x in cols:
-    #             # Create a polygon for each grid cell.
-    #             # Each cell is defined to have the full tile_w x tile_h dimensions,
-    #             # so adjacent cells will overlap by the specified amounts.
-    #             poly = Polygon([
-    #                 (x, y),
-    #                 (x + tile_w, y),
-    #                 (x + tile_w, y - tile_h),
-    #                 (x, y - tile_h)
-    #             ])
-    #             polygons.append(poly)
-
-    #             # Record the id for each cell.
-    #             df_item = pd.DataFrame({'id': [count]})
-    #             df_grid = pd.concat([df_grid, df_item], ignore_index=True)
-    #             count += 1
-
-    #     # Create a GeoDataFrame for the grid.
-    #     self.grid = gpd.GeoDataFrame(df_grid, geometry=polygons)
-
-    #     # Reset and set the index
-    #     self.grid.reset_index(drop=True, inplace=True)
-    #     self.grid.set_index("id", inplace=True)
-
-    #     # Set the coordinate reference system (CRS)
-    #     self.grid = self.grid.set_crs(epsg=self.crs, allow_override=True)
-
-        
-
-    def clip_raster(self, id, filename, scale = 1.0):
-
-        #vector = self.grid.to_crs(self.raster.crs)
-        vector = self.grid[id:id+1].to_crs(self.raster.crs)
-
-        raster = self.raster
-
-        if (scale != 1.0):
-            # Resample if necessary
-            # resample data to target shape
-            dataset = raster
-            data = dataset.read(
-                out_shape=(
-                    dataset.count,
-                    int(dataset.height * scale),
-                    int(dataset.width * scale)
-                ),
-                resampling=Resampling.bilinear
-            )
-
-            # scale image transform
-            transform = dataset.transform * dataset.transform.scale(
-                (dataset.width / data.shape[-1]),
-                (dataset.height / data.shape[-2])
-            )
-
-            #
-
-        #tile, tile_transform = mask(self.raster, [vector.geometry[id]], crop=True)
-        #tile, tile_transform = mask(raster, vector.geometry, crop=True, filled = True)
-        tile, tile_transform = mask(raster, vector.geometry, crop=True)
-
-        width = tile.shape[2]
-        height = tile.shape[1]
-
-        if "tif" in self.output_format:
-
-            tile_meta = self.raster.meta.copy()
-
-            tile_meta.update({
-                "driver":"Gtiff",
-                "height":height, # height starts with shape[1]
-                "width":width, # width starts with shape[2]
-                "transform":tile_transform
-            })
-            #print("TILE", tile.shape[1], tile.shape[2])
-            with rio.open(filename, 'w', **tile_meta) as dst:
-                dst.write(tile)
-
-        else:
-            
-            tile = np.transpose(tile, (1,2,0))
-            # print(type(tile))
-            # print(tile.shape)
-            # print(filename)
-            tile = cv.cvtColor(tile, cv.COLOR_RGB2BGR)
-            cv.imwrite(filename, tile)
-
-        return tile, width, height
-
-    def clip_vector(self, tile_grid):
-
-        if self.allow_clipped_annotations:
-            tile_vector = gpd.overlay(self.vector, tile_grid)
-        else:
-            # Identify geometries that do NOT intersect the tile grid boundaries
-            vector_no_edge_intersect = self.vector[~self.vector.intersects(tile_grid.unary_union.boundary)]
-            tile_vector = gpd.overlay(vector_no_edge_intersect, tile_grid)
-
-        #print(type(self.grid.geometry[id]))
-
-        #tile_vector = self.vector.clip(self.grid.geometry[id])
-        #tile_vector = gpd.overlay(self.vector, tile_grid)
-
-        # Save for debugging purposes
-        # print(tile_vector)
-
-        # tile_vector["row_id"] = tile_vector.index
-        # tile_vector.reset_index(drop=True, inplace=True)
-        # tile_vector.set_index("row_id", inplace = True)
-
-        # tile_vector.to_file("D:/local_mydata/ROI/sample/tile_" + str(id) + ".shp" )
-
-        return tile_vector
-    
-    def convert(self, path_output, rows = 1, scale = 1.0, overlap = 0):
-
-        # if scale != 1.0:
-        #     self.resample_raster()
-        
-        # # Configure the output folder structure
-        self.set_path_output(path_output)
-        self.create_output_folders()
-
-        # Create a vector grid for each tile
-        self.create_grid(rows, overlap, overlap)
-
-        # Extract tiles and save
-        self.extract_tiles()
-
-        # # Extract annotations
-        self.extract_annotations()
-
-        # if not "tif" in self.output_format:
-        #     # Find all .tif and .tiff files
-        #     tif_files = glob.glob(os.path.join(self.path_images, "*.tif"))
-        #     tiff_files = glob.glob(os.path.join(self.path_images, "*.tiff"))
-
-        #     # Combine and delete
-        #     for file_path in tif_files + tiff_files:
-        #         os.remove(file_path)
-        #         print(f"Deleted: {file_path}")
-
-        if self.temp_file is not None:
-            self.temp_file.close()
-
-        return

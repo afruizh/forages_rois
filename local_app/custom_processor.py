@@ -3,16 +3,11 @@ import onnxruntime as ort
 import cv2 as cv
 import numpy as np
 import pandas as pd
-import geopandas as gpd
 import shapely.geometry
 from shapely.geometry import Polygon
 
-import rasterio as rio
-from rasterio.crs import CRS
+from osgeo import gdal, ogr, osr
 import datetime
-
-from rasterio.mask import mask
-from rasterio.enums import Resampling
 
 from interface.batchprocessor import BatchProcessor
 import glob
@@ -170,8 +165,7 @@ def outputs_to_df(outputs):
     return df
 
 def pos2coords(pos, extent, img_width, img_height):
-    # extent is a rasterio BoundingBox: left, bottom, right, top
-    left, bottom, right, top = extent.left, extent.bottom, extent.right, extent.top
+    left, bottom, right, top = extent
     extent_width = right - left
     extent_height = top - bottom
     x = (pos[0]) / img_width
@@ -180,17 +174,67 @@ def pos2coords(pos, extent, img_width, img_height):
     coord_y = y * extent_height + bottom
     return (coord_x, coord_y)
 
+def create_shapefile_ogr(output_filename, geometries, projection, geom_type="polygon", allow_cols=None, data_df=None):
+    from osgeo import ogr, osr
+    driver = ogr.GetDriverByName("ESRI Shapefile")
+    if os.path.exists(output_filename):
+        driver.DeleteDataSource(output_filename)
+    data_source = driver.CreateDataSource(output_filename)
+    
+    srs = None
+    if projection:
+        srs = osr.SpatialReference()
+        try:
+            srs.ImportFromWkt(projection)
+        except Exception:
+            srs = None
+    ogr_geom_type = ogr.wkbPolygon
+    layer = data_source.CreateLayer("features", srs, ogr_geom_type)
+    
+    layer.CreateField(ogr.FieldDefn("ID", ogr.OFTInteger))
+    layer.CreateField(ogr.FieldDefn("Type", ogr.OFTString))
+    
+    if allow_cols and data_df is not None:
+        for col in allow_cols:
+            if col == "score":
+                layer.CreateField(ogr.FieldDefn("score", ogr.OFTReal))
+            elif col == "class":
+                layer.CreateField(ogr.FieldDefn("class", ogr.OFTInteger))
+            else:
+                layer.CreateField(ogr.FieldDefn(col, ogr.OFTString))
+    
+    import numpy as np
+    
+    for idx, (geom_data, (_, row)) in enumerate(zip(geometries, data_df.iterrows() if data_df is not None else [])):
+        feature = ogr.Feature(layer.GetLayerDefn())
+        feature.SetField("ID", idx+1)
+        feature.SetField("Type", "forage_plant")
+        
+        if allow_cols and data_df is not None:
+            for col in allow_cols:
+                feature.SetField(col, row[col])
+        
+        ring = ogr.Geometry(ogr.wkbLinearRing)
+        for coord in geom_data:
+            ring.AddPoint(coord[0], coord[1])
+        ring.CloseRings()
+        polygon = ogr.Geometry(ogr.wkbPolygon)
+        polygon.AddGeometry(ring)
+        feature.SetGeometry(polygon)
+        
+        layer.CreateFeature(feature)
+        feature = None
+        
+    data_source = None
 
-def save_shapefile_bb(df, extent, img_width, img_height, epsg, allow_cols=[], output_filename=None):
-    print(type(df))
-    if type(df) == "NoneType":
+def save_shapefile_bb(df, extent, img_width, img_height, epsg_or_proj, allow_cols=[], output_filename=None):
+    if df is None or df.empty:
         print("No results")
         return
 
-    df_tree_polygons_test = pd.DataFrame()
-    tree_bb = []
-    count = 0
-
+    coord_polygons = []
+    valid_df = []
+    
     for index, detection in df.iterrows():
         xmin = detection["xmin"]
         ymin = detection["ymin"]
@@ -202,72 +246,25 @@ def save_shapefile_bb(df, extent, img_width, img_height, epsg, allow_cols=[], ou
             coord = (point[0], point[1])
             new_coord = pos2coords(coord, extent, img_width, img_height)
             coord_polygon.append(new_coord)
-        #print("len", len(coord_polygon))
+        
         if len(coord_polygon) > 2:
-            polygon_object = shapely.geometry.Polygon(coord_polygon)
-            #mydic = {'Class': 'Tree', 'ID': count, 'label': 'Tree'}
-            mydic = {'Type': 'forage_plant'}
-            for col in allow_cols:
-                mydic[col] = detection[col]
-            df_item_test = pd.DataFrame(mydic, index=[count])
-            df_tree_polygons_test = pd.concat((df_tree_polygons_test, df_item_test))
-            tree_bb.append(polygon_object)
-            count = count + 1
-
-    # Create geodataframe
-    gdf_trees = gpd.GeoDataFrame(df_tree_polygons_test, geometry=tree_bb)
-    if epsg is not None:
-        gdf_trees = gdf_trees.set_crs(epsg=epsg)
-    print(gdf_trees)
-
-    # Area calculation (optional, only if extent is valid)
-    if extent is not None:
-        lon = extent.left
-        lat = extent.bottom
-        new_crs = f"+proj=cea +lat_0={lat} +lon_0={lon} +units=m"
-        gdf_trees["area_m2"] = gdf_trees.to_crs(new_crs).area
-        #gdf_trees["a_diam_m"] = np.sqrt(gdf_trees["area_m2"] * 4.0 / np.pi)
-
-    if output_filename is not None:
-        gdf_trees_bb = gdf_trees.copy()
-        print("HERE")
-        print(output_filename)        
-        if gdf_trees_bb.empty:
-        # Ensure at least the geometry column exists with correct type
-            gdf_trees_bb = gpd.GeoDataFrame(columns=gdf_trees_bb.columns, geometry='geometry', crs=gdf_trees_bb.crs)
-        safe_path = os.path.normpath(output_filename)
-        gdf_trees_bb.to_file(safe_path, index=False)
-
-    # ...existing code for saving outputs...
-    # if "bounding_boxes" in self.parameters["vector_outputs"]:
-    #     gdf_trees_bb = gdf_trees.copy()
-    #     new_output_filename = output_filename.replace("_vector.shp", "_vector_bb.shp")
-    #     gdf_trees_bb.to_file(new_output_filename, index=False)
-    #     if not new_output_filename in self.output_files:
-    #         self.output_files.append(new_output_filename)
-
-    # if "centroids" in self.parameters["vector_outputs"]:
-    #     gdf_trees_c = gdf_trees.copy()
-    #     gdf_trees_c['geometry'] = gdf_trees_c['geometry'].centroid
-    #     new_output_filename = output_filename.replace("_vector.shp", "_vector_centroids.shp")
-    #     gdf_trees_c.to_file(new_output_filename, index=False)
-    #     if not new_output_filename in self.output_files:
-    #         self.output_files.append(new_output_filename)
-
+            coord_polygons.append(coord_polygon)
+            valid_df.append(detection)
+            
+    if output_filename is not None and coord_polygons:
+        valid_df_obj = pd.DataFrame(valid_df)
+        create_shapefile_ogr(output_filename, coord_polygons, epsg_or_proj, "polygon", allow_cols, valid_df_obj)
 
 def check_raster(input_file):
-
     metadata = {}
-
-    with rio.open(input_file) as src:
-        metadata["width"] = src.width  # Image width (pixels)
-        metadata["height"] = src.height  # Image height (pixels)
-
-        return metadata
+    ds = gdal.Open(input_file)
+    metadata["width"] = ds.RasterXSize
+    metadata["height"] = ds.RasterYSize
+    ds = None
+    return metadata
     
 ## POSTPROCESSING FUNCTIONS
 import numpy as np
-import geopandas as gpd
 from shapely.geometry import box
 from shapely.geometry import Polygon
 from sklearn.decomposition import PCA
@@ -442,448 +439,223 @@ def assign_indices(rows, serpentine=False):
 
 
 # --- Filtering functions ---
-def filter_by_aspect_ratio(gdf, min_ratio=0.2, max_ratio=5.0):
-    """Remove geometries whose bounding boxes are too elongated."""
-    def is_valid_bbox(poly):
+def filter_by_aspect_ratio(wkt_list, fields_list, min_ratio=0.2, max_ratio=5.0):
+    import shapely.wkt
+    keep_wkt = []
+    keep_fields = []
+    for wkt, fields in zip(wkt_list, fields_list):
+        poly = shapely.wkt.loads(wkt)
         minx, miny, maxx, maxy = poly.bounds
         w, h = maxx - minx, maxy - miny
-        if h == 0 or w == 0:
-            return False
-        ratio = w / h
-        return min_ratio <= ratio <= max_ratio
+        if h != 0 and w != 0:
+            ratio = w / h
+            if min_ratio <= ratio <= max_ratio:
+                keep_wkt.append(wkt)
+                keep_fields.append(fields)
+    return keep_wkt, keep_fields
 
-    return gdf[gdf.geometry.apply(is_valid_bbox)].copy()
-
-def compute_iou(boxA, boxB):
-    inter = boxA.intersection(boxB).area
-    union = boxA.union(boxB).area
-    return inter / union if union > 0 else 0
-
-# def nms_polygons(gdf, iou_thresh=0.7):
-#     """Apply NMS based on bounding box IoU."""
-#     gdf = gdf.copy()
-#     boxes = [box(*geom.bounds) for geom in gdf.geometry]
-#     scores = np.array([geom.area for geom in gdf.geometry])  # or other score
-#     indices = scores.argsort()[::-1]
-
-#     keep = []
-#     suppressed = set()
-
-#     count = 0
-#     for i in indices:
-#         count += 1
-#         print(f"Processing {count}/{len(indices)}")
-#         if i in suppressed:
-#             continue
-#         keep.append(i)
-#         for j in indices:
-#             if j == i or j in suppressed:
-#                 continue
-#             iou = compute_iou(boxes[i], boxes[j])
-#             if iou > iou_thresh:
-#                 suppressed.add(j)
-#     return gdf.iloc[keep].copy()
-
-def nms_polygons(gdf, iou_thresh=0.7):
-    """Apply NMS based on bounding box IoU, optimized with spatial index."""
-    gdf = gdf.copy()
-    boxes = [box(*geom.bounds) for geom in gdf.geometry]
-    scores = np.array([geom.area for geom in gdf.geometry])  # or other score
-    indices = scores.argsort()[::-1]
-
+def polygon_nms_gdal(wkt_list, fields_list, iou_threshold=0.5):
+    import shapely.wkt
+    polys = [shapely.wkt.loads(wkt) for wkt in wkt_list]
+    scores = [poly.area for poly in polys]
+    indices = np.argsort(scores)[::-1]
+    
     keep = []
     suppressed = set()
-    sindex = gdf.sindex  # spatial index for fast bbox queries
-
+    
     for i in indices:
         if i in suppressed:
             continue
         keep.append(i)
-        # Only check for overlap with candidates whose bboxes intersect
-        candidates = list(sindex.intersection(boxes[i].bounds))
-        for j in candidates:
+        poly_i = polys[i]
+        for j in indices:
             if j == i or j in suppressed:
                 continue
-            iou = compute_iou(boxes[i], boxes[j])
-            if iou > iou_thresh:
+            poly_j = polys[j]
+            inter = poly_i.intersection(poly_j).area
+            union = poly_i.union(poly_j).area
+            iou = inter / union if union > 0 else 0
+            if iou > iou_threshold:
                 suppressed.add(j)
-    return gdf.iloc[keep].copy()
+                
+    keep_wkt = [wkt_list[i] for i in keep]
+    keep_fields = [fields_list[i] for i in keep]
+    return keep_wkt, keep_fields
 
 def rotate_polygon_to_pca_axes(polygon, centroid, axes):
-    """
-    Rotates a shapely polygon so its local axes align with the PCA axes.
-    Args:
-        polygon: shapely.geometry.Polygon
-        centroid: (x, y) tuple, the centroid of the polygon
-        axes: 2x2 numpy array, PCA axes (each row is a unit vector)
-    Returns:
-        shapely.geometry.Polygon, rotated polygon centered at the centroid
-    """
-    # Translate polygon to origin
     coords = np.array(polygon.exterior.coords) - centroid
-    # Build rotation matrix from PCA axes (axes[0] is new x, axes[1] is new y)
     R = axes
-    # Rotate
     rotated_coords = coords @ R.T
-    # Translate back to centroid
     rotated_coords += centroid
+    from shapely.geometry import Polygon
     return Polygon(rotated_coords)
 
-# Example usage after PCA and axes computation:
-# centroids = compute_centroids(gdf)
-# axes = compute_pca_axes(centroids)
-# for i, row in gdf.iterrows():
-#     poly = row.geometry
-#     centroid = poly.centroid.coords[0]
-#     gdf.at[i, "geometry_rotated"] = rotate_polygon_to_pca_axes(poly, centroid, axes)
-
-
 # --- Main pipeline ---
-def label_polygons_from_shapefile(gdf, output_path=None, serpentine=False, row_tol=10,
+def label_polygons_from_shapefile(input_shp, output_shp, serpentine=False, row_tol=10,
                                    iou_thresh=0.3, min_ratio=0.2, max_ratio=5.0, align_to_grid=False, only_postprocess=False):
-    # Save original CRS
-    orig_crs = gdf.crs
-    reproj_for_pca = False
-    utm_crs = None
-
-    # If CRS is geographic (degrees), reproject to UTM for PCA/grouping
-    if gdf.crs.is_geographic:
-        # Compute centroid longitude to pick UTM zone
-        centroid = gdf.unary_union.centroid
-        lon = centroid.x
-        lat = centroid.y
-        utm_zone = int((lon + 180) // 6) + 1
-        is_northern = lat >= 0
-        utm_crs = f"EPSG:{32600 + utm_zone if is_northern else 32700 + utm_zone}"
-        gdf = gdf.to_crs(utm_crs)
-        reproj_for_pca = True
-
-
-    print(f"Filtering by aspect ratio {min_ratio} < aspect ratio < {max_ratio}...")
-    gdf = filter_by_aspect_ratio(gdf, min_ratio, max_ratio)
-    print(f"Applytin non-max suppression with threshold {iou_thresh}...")
-    gdf = nms_polygons(gdf, iou_thresh)
-
-    if not only_postprocess:
-
-        print("Computing centroids...")
-        centroids = compute_centroids(gdf)
-
-        # # Save projected points as a shapefile for visualization/debugging
-        # projected_points_geom = [shapely.geometry.Point(pt[0], pt[1]) for pt in centroids]
-        # projected_gdf = gpd.GeoDataFrame(geometry=projected_points_geom, crs=gdf.crs)
-        # projected_gdf.to_file("./local/centroid_points.shp", index=False)
-
-        print("Removing outliers...")
-        clean_centroids = remove_outlier_centroids(centroids, threshold=4.0) # 2 standard deviations
-        print(f"Computing PCA axes...")
-        #axes, angle = compute_pca_axes(clean_centroids)
-        angle = estimate_grid_angle(clean_centroids)
-
-
-        if align_to_grid:
-            print("Aligning polygons to grid...")
-            # rotate polygons to PCA axes and update geometry in place
-            for i, row in gdf.iterrows():
-                poly = row.geometry
-                centroid = poly.centroid.coords[0]
-                #gdf.at[i, "geometry"] = rotate_polygon_to_pca_axes(poly, centroid, axes)
-
-        print("Projecting centroids to grid axes...")
-        #projected = project_to_grid_axes(centroids, axes)
-        projected = project_to_grid_axes_angle(centroids, angle)
+    from osgeo import ogr, osr
+    import shapely.wkt
+    import shapely.geometry
+    
+    driver = ogr.GetDriverByName("ESRI Shapefile")
+    ds_in = driver.Open(input_shp)
+    if ds_in is None:
+        print(f"Could not open {input_shp}")
+        return
+    layer_in = ds_in.GetLayer()
+    srs = layer_in.GetSpatialRef()
+    
+    wkt_list = []
+    fields_list = []
+    layer_defn = layer_in.GetLayerDefn()
+    field_count = layer_defn.GetFieldCount()
+    
+    for feat in layer_in:
+        geom = feat.GetGeometryRef()
+        if geom:
+            wkt_list.append(geom.ExportToWkt())
+            fields_list.append([feat.GetField(i) for i in range(field_count)])
+            
+    ds_in = None
+    
+    wkt_list, fields_list = filter_by_aspect_ratio(wkt_list, fields_list, min_ratio, max_ratio)
+    wkt_list, fields_list = polygon_nms_gdal(wkt_list, fields_list, iou_thresh)
+    
+    if not only_postprocess and wkt_list:
+        polys = [shapely.wkt.loads(wkt) for wkt in wkt_list]
+        centroids = np.array([poly.centroid.coords[0] for poly in polys])
         
-        # # Save projected points as a shapefile for visualization/debugging
-        # projected_points_geom = [shapely.geometry.Point(pt[0], pt[1]) for pt in projected]
-        # projected_gdf = gpd.GeoDataFrame(geometry=projected_points_geom, crs=gdf.crs)
-        # projected_gdf.to_file("./local/projected_points.shp", index=False)
-
-        print("Grouping projected points into rows...")
+        clean_centroids = remove_outlier_centroids(centroids, threshold=4.0)
+        angle = estimate_grid_angle(clean_centroids)
+        
+        projected = project_to_grid_axes_angle(centroids, angle)
         rows = group_rows_cols(projected, row_tol=1.0)
-        print(f"Assigning indices to rows...")
         idx_map = assign_indices(rows, serpentine)
-
-        print("Assigning numbering to polygons...")
+        
         labels = []
-        projected_points_geom = []
-        for i, geom in enumerate(gdf.geometry):
-            #print(f"processing {i}")
-            c = np.array(geom.centroid.coords[0])
-            #proj_c = np.dot(c, axes.T)
-            proj_c = project_to_grid_axes_angle(c, angle, center=centroids.mean(axis=0))
-            projected_points_geom.append(shapely.geometry.Point(proj_c[0], proj_c[1]))
-
+        for c in centroids:
+            proj_c = project_to_grid_axes_angle(np.array([c]), angle, center=centroids.mean(axis=0))[0]
             best_match = min(idx_map.keys(), key=lambda k: np.linalg.norm(np.array(k) - proj_c))
             labels.append(idx_map[best_match])
-
-        # # Save projected points as a shapefile for visualization/debugging
-        # projected_gdf = gpd.GeoDataFrame(geometry=projected_points_geom, crs=gdf.crs)
-        # projected_gdf.to_file("./local/centroid_ordering.shp", index=False)
-
-        gdf = gdf.copy()
-        gdf["grid_id"] = labels
-        #reorder the dataframe by grid_id
-        gdf = gdf.sort_values(by=["grid_id"])
-
-        # Save projected points as a shapefile for visualization/debugging
-        projected_points_geom = [shapely.geometry.Point(pt[0], pt[1]) for pt in projected]
-        projected_gdf = gpd.GeoDataFrame(geometry=projected_points_geom, crs=gdf.crs)
-        projected_gdf["grid_id"] = labels
-        projected_gdf = projected_gdf.sort_values(by=["grid_id"])
-
-        if reproj_for_pca and orig_crs is not None:
-            projected_gdf = projected_gdf.to_crs(orig_crs)
-
-        projected_gdf.to_file("./local/projected_points.shp", index=False)        
-
-    # Reproject back to original CRS if we changed it
-    if reproj_for_pca and orig_crs is not None:
-        gdf = gdf.to_crs(orig_crs)
-
-    if output_path:        
-        gdf.to_file(output_path)
-        
-
-    return gdf
-
-class TILER():
-
-    def __init__(self, path_raster, path_vector, category="tree", supercategory="tree"
-            ,allow_clipped_annotations = True, allow_no_annotations=True, class_column = [], invalid_class=[]
-            , preffix = 'tile_', crs = "6933", license = None, information = None, contributor = None, license_url = None
-            , output_format = ".tif"
-        ):
-
-        self.path_raster = path_raster # geotiff data
-        self.path_vector = path_vector # a geopandas dataframe
-        
-        self.path_output = None
-        self.path_annotations = None
-        self.path_images = None
-
-        self.raster = None
-        self.vector = None
-
-        self.gdf = None # geopandas dataframe with bounding box of raster file
-
-        self.coco_images = None
-
-        self.temp_file = None
-
-        #self.crs = "4326"
-        #self.crs = "6933" #units in meters
-        self.crs = crs
-
-        # Load files
-        self.load_files()
-
-        self.supercategory = supercategory
-        self.category = category
-        self.allow_clipped_annotations = allow_clipped_annotations
-        self.allow_no_annotations = allow_no_annotations
-
-        self.class_column = class_column
-        self.invalid_class = invalid_class
-
-        self.preffix = preffix
-
-        self.license = license
-        self.information = information
-        self.contributor = contributor
-        self.license_url = license_url
-
-        self.output_format = output_format
-
-    def load_files(self):
-
-        self.raster = rio.open(self.path_raster)
-
-        #Create bounding box
-        image_geo = self.raster
-        bb = [(image_geo.bounds[0], image_geo.bounds[3])
-                ,(image_geo.bounds[2], image_geo.bounds[3])
-                ,(image_geo.bounds[2], image_geo.bounds[1])
-                ,(image_geo.bounds[0], image_geo.bounds[1])]
-
-        self.gdf = gpd.GeoDataFrame(geometry=[shapely.geometry.Polygon(bb)])
-        #self.gdf = self.set_crs(epsg="3857")
-        self.gdf = self.gdf.set_crs(self.raster.crs)
-        self.gdf = self.gdf.to_crs(epsg=self.crs)
-
-    def create_grid(self, rows0, w_overlap=0, h_overlap=0):
-
-        cols0 = rows0
-
-        xmin, ymin, xmax, ymax = self.gdf.total_bounds
-
-        Dh = abs(ymax - ymin)
-        # oh = Dh*h_overlap
-        # tile_h = (Dh - oh)/rows0 + oh
-
-        tile_h = Dh/(rows0-rows0*h_overlap+h_overlap)
-        oh = tile_h*h_overlap
-
-        Dw = abs(xmax - xmin)
-        # ow = Dw*w_overlap
-        # tile_w = (Dw - ow)/cols0 + ow
-
-        tile_w = Dw/(cols0-cols0*w_overlap+w_overlap)
-        ow = tile_w*w_overlap
-
-
-        # # Use only the value for the max 
-        # if Dw > Dh and Dh/Dw > 0.7:
-        #     tile_h = tile_w
-        #     oh = ow
-        # elif Dh > Dw and Dw/Dh > 0.7:
-        #     tile_w = tile_h
-        #     ow = oh
-
-        # # Use only the value for the max 
-        if Dw > Dh:
-            tile_h = tile_w
-            oh = ow
-        elif Dh > Dw:
-            tile_w = tile_h
-            ow = oh
-
-        #tile_h = abs(ymax - ymin)/rows0
-        #tile_w = abs(xmax - xmin)/cols0
-
-        #cols = list(np.arange(xmin, xmax, tile_w))
-        #rows = list(np.arange(ymax, ymin, - tile_h))
-
-        #print("TILE SIZE")
-        #print(tile_h)
-        #print(tile_w)
-
-        cols = list(np.arange(xmin, xmax-(ow), tile_w - ow))
-        rows = list(np.arange(ymax, ymin-(-(oh)), - (tile_h-oh)))
-
-        #print(cols)
-        #print(rows)
-
-        df_grid = pd.DataFrame()
-
-        polygons = []
-        count = 0
-         
-        for y in rows:
-            for x in cols:
-
-                poly = Polygon([(x,y), (x+tile_w, y), (x+tile_w, y- tile_h), (x, y- tile_h)])
-
-                polygons.append(poly)
-
-                df_item = pd.DataFrame({'id': count}, index=[count])
-                df_grid = pd.concat((df_grid, df_item))
-
-                count = count + 1
-
-        #self.grid = gpd.GeoDataFrame(df_item, {'geometry':polygons})
-        self.grid = gpd.GeoDataFrame(df_grid, geometry=polygons)
-
-        # Fix index error with "module 'pandas' has no attribute 'Int64Index'"
-        self.grid.reset_index(drop=True, inplace=True)
-        self.grid.set_index("id", inplace = True)
-
-        #self.grid["row_id"] = self.grid.index + 1
-        #self.grid.reset_index(drop=True, inplace=True)
-        #self.grid.set_index("row_id", inplace = True)
-
-        self.grid = self.grid.set_crs(epsg=self.crs, allow_override=True)
-        #grid.to_file("grid.shp")
-
-    def extract_tiles(self, scale = 1.0):
-
-            #size = 256
-
-            #splitImageIntoCells(self.raster, self.path_images, size)
-
-            coco_images = []
-
-            for i, grid_element in enumerate(self.grid.geometry):
-                basename = self.preffix + str(i) + self.output_format
-                filename = os.path.join(self.path_images, basename)
-
-                if os.path.exists(filename):
-                    print(f"File already exists {filename}")
-                    continue
-
-
-                tile, w, h = self.clip_raster(i, filename)
-                
-
-                coco_images.append({
-                    "id": i+1
-                    , "file_name": basename
-                    , "width": w
-                    , "height": h
-                })   
-
-            self.coco_images = coco_images 
-
-            return
-
-    def clip_raster(self, id, filename, scale = 1.0):
-
-        #vector = self.grid.to_crs(self.raster.crs)
-        vector = self.grid[id:id+1].to_crs(self.raster.crs)
-
-        raster = self.raster
-
-        if (scale != 1.0):
-            # Resample if necessary
-            # resample data to target shape
-            dataset = raster
-            data = dataset.read(
-                out_shape=(
-                    dataset.count,
-                    int(dataset.height * scale),
-                    int(dataset.width * scale)
-                ),
-                resampling=Resampling.bilinear
-            )
-
-            # scale image transform
-            transform = dataset.transform * dataset.transform.scale(
-                (dataset.width / data.shape[-1]),
-                (dataset.height / data.shape[-2])
-            )
-
-            #
-
-        #tile, tile_transform = mask(self.raster, [vector.geometry[id]], crop=True)
-        #tile, tile_transform = mask(raster, vector.geometry, crop=True, filled = True)
-        tile, tile_transform = mask(raster, vector.geometry, crop=True)
-
-        width = tile.shape[2]
-        height = tile.shape[1]
-
-        if "tif" in self.output_format:
-
-            tile_meta = self.raster.meta.copy()
-
-            tile_meta.update({
-                "driver":"Gtiff",
-                "height":height, # height starts with shape[1]
-                "width":width, # width starts with shape[2]
-                "transform":tile_transform
-            })
-            #print("TILE", tile.shape[1], tile.shape[2])
-            with rio.open(filename, 'w', **tile_meta) as dst:
-                dst.write(tile)
-
-        else:
             
-            tile = np.transpose(tile, (1,2,0))
-            # print(type(tile))
-            # print(tile.shape)
-            # print(filename)
-            tile = cv.cvtColor(tile, cv.COLOR_RGB2BGR)
-            cv.imwrite(filename, tile)
+        combined = list(zip(labels, wkt_list, fields_list))
+        combined.sort(key=lambda x: x[0])
+        labels, wkt_list, fields_list = zip(*combined) if combined else ([], [], [])
+        
+    if os.path.exists(output_shp):
+        driver.DeleteDataSource(output_shp)
+    ds_out = driver.CreateDataSource(output_shp)
+    layer_out = ds_out.CreateLayer("labeled", srs, ogr.wkbPolygon)
+    
+    for i in range(field_count):
+        layer_out.CreateField(layer_defn.GetFieldDefn(i))
+    if not only_postprocess:
+        layer_out.CreateField(ogr.FieldDefn("grid_id", ogr.OFTInteger))
+        
+    for idx, (wkt, fields) in enumerate(zip(wkt_list, fields_list)):
+        geom = ogr.CreateGeometryFromWkt(wkt)
+        feat = ogr.Feature(layer_out.GetLayerDefn())
+        for i, val in enumerate(fields):
+            feat.SetField(i, val)
+        if not only_postprocess:
+            feat.SetField("grid_id", labels[idx])
+        feat.SetGeometry(geom)
+        layer_out.CreateFeature(feat)
+        feat = None
+        
+    ds_out = None
 
-        return tile, width, height
+def merge_shp_gdal(shp_paths, output_path, dissolve=False, explode=False, nms=False, nms_iou=0.5):
+    from osgeo import ogr
+    driver = ogr.GetDriverByName("ESRI Shapefile")
+    if os.path.exists(output_path):
+        driver.DeleteDataSource(output_path)
+    if not shp_paths:
+        return None
+    ds_template = driver.Open(shp_paths[0])
+    layer_template = ds_template.GetLayer()
+    srs = layer_template.GetSpatialRef()
+    geom_type = layer_template.GetGeomType()
+    layer_defn = layer_template.GetLayerDefn()
+    ds_template = None
+    ds_out = driver.CreateDataSource(output_path)
+    layer_out = ds_out.CreateLayer("merged", srs, geom_type)
+    for i in range(layer_defn.GetFieldCount()):
+        layer_out.CreateField(layer_defn.GetFieldDefn(i))
+    for shp_path in shp_paths:
+        ds_in = driver.Open(shp_path)
+        if ds_in is None:
+            continue
+        layer_in = ds_in.GetLayer()
+        for feat_in in layer_in:
+            geom = feat_in.GetGeometryRef()
+            if geom:
+                feat_out = ogr.Feature(layer_out.GetLayerDefn())
+                for i in range(layer_defn.GetFieldCount()):
+                    feat_out.SetField(i, feat_in.GetField(i))
+                feat_out.SetGeometry(geom.Clone())
+                layer_out.CreateFeature(feat_out)
+                feat_out = None
+        ds_in = None
+    ds_out.FlushCache()
+    ds_out = None
+    return output_path
+
+def tile_raster_gdal(input_raster_path, tiles_dir, tile_size, prefix=""):
+    from osgeo import gdal
+    src_ds = gdal.Open(input_raster_path)
+    if src_ds is None:
+        raise ValueError(f"Could not open raster: {input_raster_path}")
+    width = src_ds.RasterXSize
+    height = src_ds.RasterYSize
+    bands = src_ds.RasterCount
+    geotransform = src_ds.GetGeoTransform()
+    projection = src_ds.GetProjection()
+    data_type = src_ds.GetRasterBand(1).DataType
+    tiles_x = int(np.ceil(width / tile_size))
+    tiles_y = int(np.ceil(height / tile_size))
+    os.makedirs(tiles_dir, exist_ok=True)
+    tile_files = []
+    tile_count = 0
+    nodata_value = -9999
+    for row in range(tiles_y):
+        for col in range(tiles_x):
+            tile_filename = os.path.join(tiles_dir, f"{prefix}{tile_count:05d}.tif")
+            if os.path.exists(tile_filename):
+                tile_files.append(tile_filename)
+                tile_count += 1
+                continue
+            x_offset = col * tile_size
+            y_offset = row * tile_size
+            x_size = min(tile_size, width - x_offset)
+            y_size = min(tile_size, height - y_offset)
+            tile_geotransform = list(geotransform)
+            tile_geotransform[0] = geotransform[0] + x_offset * geotransform[1]
+            tile_geotransform[3] = geotransform[3] + y_offset * geotransform[5]
+            driver = gdal.GetDriverByName('GTiff')
+            tile_ds = driver.Create(tile_filename, tile_size, tile_size, bands, data_type, options=['TILED=YES', 'COMPRESS=LZW', 'BIGTIFF=IF_SAFER'])
+            tile_ds.SetGeoTransform(tile_geotransform)
+            tile_ds.SetProjection(projection)
+            for band_idx in range(1, bands + 1):
+                src_band = src_ds.GetRasterBand(band_idx)
+                tile_band = tile_ds.GetRasterBand(band_idx)
+                data = src_band.ReadAsArray(x_offset, y_offset, x_size, y_size)
+                if x_size < tile_size or y_size < tile_size:
+                    if np.issubdtype(data.dtype, np.unsignedinteger) and nodata_value < 0:
+                        nodata_value = 255
+                    padded_data = np.full((tile_size, tile_size), nodata_value, dtype=data.dtype)
+                    padded_data[:y_size, :x_size] = data
+                    data = padded_data
+                tile_band.WriteArray(data)
+                tile_band.SetNoDataValue(nodata_value)
+            tile_ds.FlushCache()
+            tile_ds = None
+            tile_files.append(tile_filename)
+            tile_count += 1
+    src_ds = None
+    return tile_files
+
+
     
 
 class ForagesROIsDetector():
@@ -1027,114 +799,77 @@ class ForagesROIsDetector():
                                 , progress_callback=progress_callback
                                 , interruption_check=interruption_check
                                 )
-
-    def tile_inference(self, input_filepath, output_filepath, only=False):
+    def tile_inference(self, input_filepath, output_filepath, only=False, clean_cache=False):
 
         # Get basename without extension
         basename = os.path.splitext(os.path.basename(output_filepath))[0]
 
         # Set output folder as filepath dir
         output_folder = os.path.dirname(output_filepath)
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        #output_folder = os.path.join(output_folder, f"{basename}_{timestamp}")
-        output_folder = os.path.join(output_folder, f"{basename}_foragesrois_temp")
-        images_dir = os.path.join(output_folder, "tiles")
-        shp_dir = os.path.join(output_folder, "shp")
         
-
+        from .cachemanager import CacheManager
+        cache_manager = CacheManager(project_path=output_folder)
+        
+        tile_size = 1024
+        
+        cache_key = {
+            "input_raster_path": input_filepath,
+            "tile_size": tile_size
+        }
+        key = cache_manager.compute_key(cache_key)
+        
+        images_dir = cache_manager.get_cache_folder_path("tiles", key)
+        shp_dir = cache_manager.get_cache_folder_path("shp", key)
+        
         os.makedirs(output_folder, exist_ok=True)
-        os.makedirs(images_dir, exist_ok=True)
-        os.makedirs(shp_dir, exist_ok=True)
 
-        # tiling
-        converter = TILER(input_filepath
-                , ""
-                , category = "category"
-                , supercategory = "supercategory"
-                , allow_clipped_annotations = False
-                , allow_no_annotations = False
-                , class_column = ["label"]
-                , invalid_class=["target", "empty"]
-                , preffix = ''
-                , crs = "4326"
-                )
-        
-        converter.path_images = images_dir
-        
-        metadata = check_raster(input_filepath)
-
-
-        w = metadata["width"]
-        h = metadata["height"]
-        max_px = 1024
-        overlap = 0.25
-
-        rows = 1
-
-        if (w > max_px or h > max_px):
-
-            max_val = max(w,h)
-            #print(max_val)        
-            #rows = np.ceil(max_val/final_max_px)
-            #rows = (max_val - np.ceil(overlap*max_val))/(max_px - np.ceil(overlap*max_val))
-            rows = np.ceil((max_val-overlap*max_px)/(max_px*(1-overlap)))
-
-        print("rows", rows)
-        print("overlap", overlap)
-
-        # Create a vector grid for each tile
-        converter.create_grid(rows, overlap, overlap)
-
-        # Extract tiles and save
-        converter.extract_tiles()
-
+        # Extract tiles and save using GDAL
+        if not cache_manager.exists("tiles", key):
+            print(f"Extracting tiles from {input_filepath} to cache...")
+            tile_raster_gdal(input_filepath, images_dir, tile_size, prefix="tile_")
+        else:
+            print(f"Using cached tiles from {images_dir}")
 
         # Process each tile
-        self.batch_processing(images_dir,shp_dir)
+        self.batch_processing(images_dir, shp_dir)
 
         # Merge all shapefiles in shp_dir and save
-        # Find all shapefiles in shp_dir
         shp_files = glob.glob(os.path.join(shp_dir, "*.shp"))
         print(f"Merging {len(shp_files)} files")
 
         if shp_files:
-            gdfs = [] #= [gpd.read_file(os.path.normpath(shp)) for shp in shp_files]
-            for shp in shp_files:
-                gdf = gpd.read_file(os.path.normpath(shp))
-                if not gdf.empty:
-                    gdfs.append(gdf)
-
-            print(f"Merging {len(gdfs)} files with detections")
-
-
-            merged_gdf = pd.concat(gdfs, ignore_index=True)
-            merged_gdf = gpd.GeoDataFrame(merged_gdf, geometry="geometry")
-
+            merged_dir = cache_manager.get_cache_folder_path("merged", key)
+            merged_shp = os.path.join(merged_dir, "merged.shp")
+            merge_shp_gdal(shp_files, merged_shp)
 
             # Post process the merged shapefile
-            if not only:
-                gdf_labeled = label_polygons_from_shapefile(merged_gdf, serpentine=True, row_tol=1.0, min_ratio=1/1.8, max_ratio=1.8, iou_thresh=0.15, align_to_grid=False)
-            else:
-                gdf_labeled = merged_gdf
-
-
-            #merged_gdf.to_file(output_filepath, index=False)
             safe_path = os.path.normpath(output_filepath)
-            gdf_labeled.to_file(safe_path, index=False)
+            if not only:
+                label_polygons_from_shapefile(merged_shp, safe_path, serpentine=True, row_tol=1.0, min_ratio=1/1.8, max_ratio=1.8, iou_thresh=0.15, align_to_grid=False)
+            else:
+                import shutil
+                shutil.copyfile(merged_shp, safe_path)
+                if os.path.exists(merged_shp.replace('.shp','.shx')):
+                    shutil.copyfile(merged_shp.replace('.shp','.shx'), safe_path.replace('.shp','.shx'))
+                if os.path.exists(merged_shp.replace('.shp','.dbf')):
+                    shutil.copyfile(merged_shp.replace('.shp','.dbf'), safe_path.replace('.shp','.dbf'))
+                if os.path.exists(merged_shp.replace('.shp','.prj')):
+                    shutil.copyfile(merged_shp.replace('.shp','.prj'), safe_path.replace('.shp','.prj'))
+            
+            if clean_cache:
+                print("Cleaning cache for this execution...")
+                cache_manager.clean_cache_folder_path("tiles", key)
+                cache_manager.clean_cache_folder_path("shp", key)
+                cache_manager.clean_cache_folder_path("merged", key)
         else:
             print("No shapefiles found to merge in", shp_dir)
 
-    def plot_numbering(self, input_filepath, output_filepath, serpentine=True, align_to_grid=False,only_postprocess=False):
-
+    def plot_numbering(self, input_filepath, output_filepath, serpentine=True, align_to_grid=False, only_postprocess=False):
         safe_input_filepath = os.path.normpath(input_filepath)
         safe_input_output_filepath = os.path.normpath(output_filepath)        
-
-        merged_gdf = gpd.read_file(safe_input_filepath)
         
         # Post process the merged shapefile
-        gdf_labeled = label_polygons_from_shapefile(merged_gdf, serpentine=serpentine, row_tol=1.0, min_ratio=1/1.8, max_ratio=1.8, iou_thresh=0.15, align_to_grid=align_to_grid, only_postprocess=only_postprocess)
-
-        gdf_labeled.to_file(safe_input_output_filepath, index=False)
+        label_polygons_from_shapefile(safe_input_filepath, safe_input_output_filepath, serpentine=serpentine, row_tol=1.0, min_ratio=1/1.8, max_ratio=1.8, iou_thresh=0.15, align_to_grid=align_to_grid, only_postprocess=only_postprocess)e)
 
 
 
