@@ -53,6 +53,8 @@ class ProcessorInterface(QObject):
     msg = Signal(str)
     finished = Signal(dict)
     progressUpdated = Signal(dict) # Relay progress signal
+    visualizationReady = Signal(str) # New signal for QML visualization
+    rasterPreviewReady = Signal(str) # New signal for raw raster preview
 
     def initialize(self):
         pass
@@ -81,8 +83,156 @@ class ProcessorInterface(QObject):
         """Handle the process completion."""
         self.finished.emit(info)
         print("Process finished signal emitted.")
+        
+        # Try to generate visualization
+        self.generateVisualization()
+
         # Clean up worker reference
         self.worker = None
+
+    @Slot(str)
+    def previewRaster(self, input_raster):
+        """Generates a quick thumbnail preview of the input raster without any shapefiles."""
+        import traceback
+        try:
+            if not input_raster or not os.path.exists(input_raster):
+                return
+            
+            import cv2
+            import numpy as np
+            from osgeo import gdal
+            
+            ds = gdal.Open(input_raster)
+            if not ds:
+                return
+                
+            thumbnail_size = (800, 800)
+            w = ds.RasterXSize
+            h = ds.RasterYSize
+            
+            scale_x = thumbnail_size[0] / w
+            scale_y = thumbnail_size[1] / h
+            scale = min(scale_x, scale_y)
+            
+            new_w = int(w * scale)
+            new_h = int(h * scale)
+            
+            img = ds.ReadAsArray(0, 0, w, h, buf_xsize=new_w, buf_ysize=new_h)
+            if len(img.shape) == 3:
+                img = img.transpose(1, 2, 0)
+                if img.shape[2] >= 3:
+                    img = img[:, :, :3]
+            elif len(img.shape) == 2:
+                img = np.stack([img, img, img], axis=-1)
+                
+            if img.dtype != np.uint8:
+                img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+                
+            vis_path = os.path.join(os.path.expanduser("~"), ".cache_forages_rois", "preview_raster.png")
+            os.makedirs(os.path.dirname(vis_path), exist_ok=True)
+            
+            img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(vis_path, img_bgr)
+            
+            self.rasterPreviewReady.emit(vis_path)
+            print(f"Raster preview saved to {vis_path}")
+        except Exception as e:
+            print(f"Raster preview error: {e}")
+            traceback.print_exc()
+
+    def generateVisualization(self):
+        import traceback
+        try:
+            if not hasattr(self, 'last_params') or not self.last_params:
+                return
+
+            input_raster = self.last_params.get("input_file")
+            output_folder = self.last_params.get("output_folder")
+            
+            if not input_raster or not output_folder:
+                return
+                
+            basename = os.path.splitext(os.path.basename(input_raster))[0]
+            
+            if output_folder.lower().endswith(".shp"):
+                output_shp = output_folder
+            else:
+                # We expect custom_processor.tile_inference to write to output_folder/basename.shp or similar
+                output_shp = os.path.join(output_folder, f"{basename}.shp")
+                if not os.path.exists(output_shp):
+                    output_shp = os.path.join(output_folder, "merged.shp")
+            
+            if not os.path.exists(output_shp):
+                print(f"Cannot visualize: Output shapefile not found at {output_shp}")
+                return
+
+            import cv2
+            import numpy as np
+            from osgeo import gdal, ogr
+            
+            ds = gdal.Open(input_raster)
+            if not ds:
+                return
+                
+            thumbnail_size = (800, 800)
+            
+            w = ds.RasterXSize
+            h = ds.RasterYSize
+            
+            scale_x = thumbnail_size[0] / w
+            scale_y = thumbnail_size[1] / h
+            scale = min(scale_x, scale_y)
+            
+            new_w = int(w * scale)
+            new_h = int(h * scale)
+            
+            img = ds.ReadAsArray(0, 0, w, h, buf_xsize=new_w, buf_ysize=new_h)
+            if len(img.shape) == 3:
+                img = img.transpose(1, 2, 0)
+                if img.shape[2] >= 3:
+                    img = img[:, :, :3]
+            elif len(img.shape) == 2:
+                img = np.stack([img, img, img], axis=-1)
+                
+            if img.dtype != np.uint8:
+                img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+                
+            shp_ds = ogr.Open(output_shp)
+            if shp_ds is not None:
+                layer = shp_ds.GetLayer()
+                gt = ds.GetGeoTransform()
+                inv_gt = gdal.InvGeoTransform(gt)
+                
+                for feature in layer:
+                    geom = feature.GetGeometryRef()
+                    if geom is not None:
+                        # Only processing the outer ring for simplicity in preview
+                        ring = geom.GetGeometryRef(0) if geom.GetGeometryCount() > 0 else geom
+                        if ring:
+                            pts = []
+                            for i in range(ring.GetPointCount()):
+                                x, y, _ = ring.GetPoint(i)
+                                px = int(inv_gt[0] + inv_gt[1]*x + inv_gt[2]*y)
+                                py = int(inv_gt[3] + inv_gt[4]*x + inv_gt[5]*y)
+                                pts.append([int(px * scale), int(py * scale)])
+                            
+                            if pts:
+                                pts = np.array(pts, np.int32)
+                                pts = pts.reshape((-1, 1, 2))
+                                cv2.polylines(img, [pts], isClosed=True, color=(0, 255, 0), thickness=2)
+                
+            vis_path = os.path.join(os.path.expanduser("~"), ".cache_forages_rois", "vis.png")
+            os.makedirs(os.path.dirname(vis_path), exist_ok=True)
+            
+            img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(vis_path, img_bgr)
+            
+            self.visualizationReady.emit(vis_path)
+            print(f"Visualization saved to {vis_path}")
+            
+        except Exception as e:
+            print(f"Visualization error: {e}")
+            traceback.print_exc()
 
     @Slot(str)
     def openOutputFile(self, output_file):
@@ -90,11 +240,11 @@ class ProcessorInterface(QObject):
         output_file = output_file.replace("file:///","")
         if os.path.exists(output_file):
             try:
+                import subprocess
                 if os.name == 'nt':  # Windows
                     os.startfile(output_file)
                 elif os.name == 'posix':  # macOS/Linux
                     subprocess.run(["open", output_file])  # macOS
-                    # subprocess.run(["xdg-open", output_file])  # Linux (uncomment if needed)
             except Exception as e:
                 print(f"Failed to open file: {e}")
         else:
@@ -105,6 +255,7 @@ class ProcessorInterface(QObject):
         """Open the output folder in the default file explorer."""
         if os.path.isdir(output_folder): # Check if it's a valid directory
             try:
+                import subprocess
                 if os.name == 'nt':  # Windows
                     os.startfile(output_folder)
                 elif os.name == 'posix':  # macOS/Linux
@@ -128,7 +279,6 @@ class ProcessorInterface(QObject):
     def saveParametersJson(self, file_path, json_data_string):
         """Saves the provided JSON string to the specified file path."""
         try:
-            # Parse just to ensure it's valid JSON before writing
             params = json.loads(json_data_string)
             with open(file_path, 'w') as f:
                 json.dump(params, f, indent=4) # Write with indentation
@@ -145,18 +295,17 @@ class ProcessorInterface(QObject):
                 raise FileNotFoundError(f"Parameter file not found: {file_path}")
             with open(file_path, 'r') as f:
                 params = json.load(f)
-            # Basic validation (optional but recommended)
             if "inputFolder" not in params or "outputFolder" not in params:
                  raise ValueError("Invalid parameter file format.")
-            self.parametersLoaded.emit(params) # Emit signal with loaded data
+            self.parametersLoaded.emit(params) 
             print(f"Parameters loaded from: {file_path}")
         except Exception as e:
             print(f"Error loading parameters from {file_path}: {e}")
             self.saveLoadError.emit(f"Error loading parameters: {e}")
 
-
     @Slot(dict)
     def process(self, params):
+        self.last_params = params
         self.worker = Worker(params)
         self.worker.finished.connect(self.onProcessFinished)
         self.worker.progressUpdated.connect(self.progressUpdated)

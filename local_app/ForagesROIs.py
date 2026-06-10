@@ -44,45 +44,58 @@ if USE_RESOURCES:
     RES_PREFIX = ":/"
 
 def run_gui():
+    import os
+    os.environ["QT_QUICK_CONTROLS_STYLE"] = "Fusion"
 
-    print("Not implemented yet")
+    #from PySide6.QtWidgets import QApplication
+    #from PySide6.QtGui import QIcon
+    #from PySide6.QtQml import QQmlApplicationEngine
+    from PySide6.QtGui import QGuiApplication
+    from PySide6.QtQml import QQmlApplicationEngine
+    from PySide6.QtCore import QUrl
+    from PySide6.QtCore import Qt
 
-    # app = QApplication(sys.argv)
+    #pp = QApplication(sys.argv)
 
-    # # --- Add Application Metadata ---
-    # app.setApplicationName("ForagesROIs")
-    # app.setOrganizationName("Tropical Forages Program | CIAT") # Replace with your company
-    # #app.setOrganizationDomain("") # Replace with your domain
-    # app.setApplicationVersion("0.1.0")
-    # # --- End Metadata ---
+    
 
-    # app.setWindowIcon(QIcon(RES_PREFIX + "icon.png"))
-
-    # # # Create the splash screen.  Use a QPixmap for image loading.
-    # # splash_pix = QPixmap(RES_PREFIX + "logo_small.png")
-    # # if not splash_pix.isNull(): # check if the image loaded correctly.
-    # #     splash = QSplashScreen(splash_pix)
-    # #     splash.show()
-    # #     app.processEvents()  # Ensure the splash screen is displayed.
-    # #     time.sleep(2)
-    # # else:
-    # #     splash = None # if image didn't load, don't show a splash
-
-    # processorInterface = ProcessorInterface()
+    processorInterface = ProcessorInterface()
     
     # engine = QQmlApplicationEngine()
     # engine.quit.connect(app.quit)
     # engine.rootContext().setContextProperty("processorInterface", processorInterface)
-    # engine.load(RES_PREFIX + "view.qml")
-
-    # if engine.rootObjects():
-    #     if splash:
-    #         splash.finish(None)
+    
+    # # Load the new view.qml
+    # qml_path = os.path.join(os.path.dirname(__file__), "view.qml")
+    
+    # # Ensure URL formatting for QML engine
+    # if os.name == 'nt':
+    #     qml_url = "file:///" + qml_path.replace("\\", "/")
     # else:
+    #     qml_url = "file://" + qml_path
+
+    # engine.load(qml_url)
+
+    # if not engine.rootObjects():
     #     print("QML load failed")
     #     sys.exit(1)
 
     # sys.exit(app.exec())
+
+    app = QGuiApplication(sys.argv)
+
+    app.setApplicationName("ForagesROIs")
+    app.setOrganizationName("Tropical Forages Program | Alliance Bioversity International & CIAT")
+    app.setApplicationVersion("1.0.0")
+
+    app.styleHints().setColorScheme(Qt.ColorScheme.Light)
+
+    engine = QQmlApplicationEngine()
+    engine.quit.connect(app.quit)
+    engine.rootContext().setContextProperty("processorInterface", processorInterface)
+    engine.load(QUrl("view.qml"))
+
+    sys.exit(app.exec())
 
 def run_cli(args):
     print("working")

@@ -807,7 +807,10 @@ class ForagesROIsDetector():
         # Set output folder as filepath dir
         output_folder = os.path.dirname(output_filepath)
         
-        from .cachemanager import CacheManager
+        try:
+            from cachemanager import CacheManager
+        except ImportError:
+            from .cachemanager import CacheManager
         cache_manager = CacheManager(project_path=output_folder)
         
         tile_size = 1024
@@ -869,7 +872,7 @@ class ForagesROIsDetector():
         safe_input_output_filepath = os.path.normpath(output_filepath)        
         
         # Post process the merged shapefile
-        label_polygons_from_shapefile(safe_input_filepath, safe_input_output_filepath, serpentine=serpentine, row_tol=1.0, min_ratio=1/1.8, max_ratio=1.8, iou_thresh=0.15, align_to_grid=align_to_grid, only_postprocess=only_postprocess)e)
+        label_polygons_from_shapefile(safe_input_filepath, safe_input_output_filepath, serpentine=serpentine, row_tol=1.0, min_ratio=1/1.8, max_ratio=1.8, iou_thresh=0.15, align_to_grid=align_to_grid, only_postprocess=only_postprocess)
 
 
 

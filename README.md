@@ -111,6 +111,20 @@ arch = "x86_64"
 extra_args = --quiet --noinclude-qt-translations
 ``` -->
 
+```
+conda env create -f environment.yml
+conda activate forages_rois
+```
+
+## Updates
+
+### V1.0
+
+- [X] Automatic tiling (tiling, processing, merging)
+- [X] Cache System
+- [X] Migration rasterio to gdal
+- [X] Migration geopandas to gdal
+
 ## License
 
 This project is licensed under the **Apache License 2.0** - see the [LICENSE](LICENSE) file for details.
