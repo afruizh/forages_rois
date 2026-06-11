@@ -51,9 +51,10 @@ def run_gui():
     #from PySide6.QtGui import QIcon
     #from PySide6.QtQml import QQmlApplicationEngine
     from PySide6.QtGui import QGuiApplication
-    from PySide6.QtQml import QQmlApplicationEngine
+    from PySide6.QtQml import QQmlApplicationEngine, qmlRegisterType
     from PySide6.QtCore import QUrl
     from PySide6.QtCore import Qt
+    from interface.raster_preview_item import RasterPreviewItem
 
     #pp = QApplication(sys.argv)
 
@@ -89,6 +90,8 @@ def run_gui():
     app.setApplicationVersion("1.0.0")
 
     app.styleHints().setColorScheme(Qt.ColorScheme.Light)
+
+    qmlRegisterType(RasterPreviewItem, "CustomComponents", 1, 0, "RasterPreviewItem")
 
     engine = QQmlApplicationEngine()
     engine.quit.connect(app.quit)

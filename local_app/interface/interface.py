@@ -55,6 +55,7 @@ class ProcessorInterface(QObject):
     progressUpdated = Signal(dict) # Relay progress signal
     visualizationReady = Signal(str) # New signal for QML visualization
     rasterPreviewReady = Signal(str) # New signal for raw raster preview
+    visualizationPathsReady = Signal(str, str) # Emits (raster_path, shp_path)
 
     def initialize(self):
         pass
@@ -127,6 +128,8 @@ class ProcessorInterface(QObject):
                 
             if img.dtype != np.uint8:
                 img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+            else:
+                img = np.ascontiguousarray(img)
                 
             vis_path = os.path.join(os.path.expanduser("~"), ".cache_forages_rois", "preview_raster.png")
             os.makedirs(os.path.dirname(vis_path), exist_ok=True)
@@ -196,6 +199,8 @@ class ProcessorInterface(QObject):
                 
             if img.dtype != np.uint8:
                 img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+            else:
+                img = np.ascontiguousarray(img)
                 
             shp_ds = ogr.Open(output_shp)
             if shp_ds is not None:
@@ -228,6 +233,7 @@ class ProcessorInterface(QObject):
             cv2.imwrite(vis_path, img_bgr)
             
             self.visualizationReady.emit(vis_path)
+            self.visualizationPathsReady.emit(input_raster, output_shp)
             print(f"Visualization saved to {vis_path}")
             
         except Exception as e:

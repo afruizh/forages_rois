@@ -4,6 +4,7 @@ import QtQuick.Layouts
 import QtQuick.Dialogs
 import Qt5Compat.GraphicalEffects
 import QtQuick.Effects
+import CustomComponents 1.0
 
 ApplicationWindow {
     id: mainWindow
@@ -131,7 +132,8 @@ ApplicationWindow {
         nameFilters: ["Raster files (*.tif *.tiff)", "All files (*)"]
         onAccepted: {
             inputRasterPath = urlToLocalPath(fileDialog.currentFile.toString())
-            processorInterface.previewRaster(inputRasterPath)
+            loadingIndicator.running = true
+            rasterLoadTimer.start()
         }
     }
 
@@ -175,7 +177,14 @@ ApplicationWindow {
         }
         function onRasterPreviewReady(imagePath) {
             previewImage.source = "file:///" + imagePath + "?" + new Date().getTime()
+            rasterItem.sourcePath = inputRasterPath
+            rasterItem.shapefilePath = ""
             statusLabel.text = "Raster preview generated. Ready for inference."
+        }
+        function onVisualizationPathsReady(rasterPath, shpPath) {
+            rasterItem.sourcePath = rasterPath
+            rasterItem.shapefilePath = shpPath
+            console.log("Vector paths set:", rasterPath, shpPath)
         }
     }
 
@@ -284,18 +293,26 @@ ApplicationWindow {
                                         ColumnLayout {
                                             Layout.fillWidth: true
                                             spacing: 5
+                                            
+                                            CheckBox {
+                                                id: useVectorOverlayCheckbox
+                                                text: "Use Native Vector Overlay (High Res)"
+                                                checked: true
+                                            }
+
                                             Button {
                                                 text: "Run Inference"
                                                 Layout.fillWidth: true
                                                 font.bold: true
-                                                enabled: inputRasterPath !== "" && outputFolderPath !== ""
+                                                enabled: true//inputRasterPath !== "" && outputFolderPath !== ""
                                                 onClicked: {
                                                     progressBar.value = 0
                                                     statusLabel.text = "Processing started..."
                                                     var params = {
                                                         "task": taskCombo.currentText,
                                                         "input_file": inputRasterPath,
-                                                        "output_folder": outputFolderPath
+                                                        "output_folder": outputFolderPath,
+                                                        "use_vector_overlay": useVectorOverlayCheckbox.checked
                                                     }
                                                     processorInterface.process(params)
                                                 }
@@ -348,12 +365,42 @@ ApplicationWindow {
                                     id: previewContainer
                                     color: "#e0e0e0"
                                     clip: true
+                                    
+                                    property real currentZoom: 1.0
+
+                                    BusyIndicator {
+                                        id: loadingIndicator
+                                        anchors.centerIn: parent
+                                        running: false
+                                        visible: running
+                                        z: 10
+                                    }
+
+                                    Timer {
+                                        id: rasterLoadTimer
+                                        interval: 50
+                                        repeat: false
+                                        onTriggered: {
+                                            processorInterface.previewRaster(inputRasterPath)
+                                            loadingIndicator.running = false
+                                        }
+                                    }
+
+                                    RasterPreviewItem {
+                                        id: rasterItem
+                                        anchors.fill: parent
+                                        visible: useVectorOverlayCheckbox.checked
+                                        contentX: flickable.contentX
+                                        contentY: flickable.contentY
+                                        zoomScale: previewContainer.currentZoom
+                                        showVectorOverlay: true
+                                    }
 
                                     Flickable {
                                         id: flickable
                                         anchors.fill: parent
-                                        contentWidth: previewImage.width * previewImage.scale
-                                        contentHeight: previewImage.height * previewImage.scale
+                                        contentWidth: useVectorOverlayCheckbox.checked ? (rasterItem.rasterWidth * previewContainer.currentZoom) : (previewImage.width * previewContainer.currentZoom)
+                                        contentHeight: useVectorOverlayCheckbox.checked ? (rasterItem.rasterHeight * previewContainer.currentZoom) : (previewImage.height * previewContainer.currentZoom)
                                         clip: true
                                         boundsBehavior: Flickable.StopAtBounds
                                         maximumFlickVelocity: 0
@@ -361,11 +408,19 @@ ApplicationWindow {
                                         
                                         Image {
                                             id: previewImage
+                                            visible: !useVectorOverlayCheckbox.checked
                                             width: previewContainer.width
                                             height: previewContainer.height
+                                            scale: previewContainer.currentZoom
                                             fillMode: Image.PreserveAspectFit
                                             cache: false
                                             transformOrigin: Item.TopLeft
+                                        }
+
+                                        Item {
+                                            visible: useVectorOverlayCheckbox.checked
+                                            width: rasterItem.rasterWidth * previewContainer.currentZoom
+                                            height: rasterItem.rasterHeight * previewContainer.currentZoom
                                         }
                                     }
 
@@ -374,13 +429,13 @@ ApplicationWindow {
                                         acceptedButtons: Qt.NoButton
                                         onWheel: (wheel) => {
                                             var zoomFactor = wheel.angleDelta.y > 0 ? 1.1 : 0.9
-                                            var newScale = previewImage.scale * zoomFactor
-                                            if (newScale >= 1.0 && newScale <= 20.0) {
-                                                var oldScale = previewImage.scale
+                                            var newScale = previewContainer.currentZoom * zoomFactor
+                                            if (newScale >= 0.001 && newScale <= 100.0) {
+                                                var oldScale = previewContainer.currentZoom
                                                 var mouseXRel = (wheel.x + flickable.contentX) / oldScale
                                                 var mouseYRel = (wheel.y + flickable.contentY) / oldScale
                                                 
-                                                previewImage.scale = newScale
+                                                previewContainer.currentZoom = newScale
                                                 
                                                 flickable.contentX = (mouseXRel * newScale) - wheel.x
                                                 flickable.contentY = (mouseYRel * newScale) - wheel.y
@@ -390,7 +445,7 @@ ApplicationWindow {
                                     
                                     Text {
                                         text: "Visual Preview\n(Drag & Drop Raster Image Here)"
-                                        visible: previewImage.source == ""
+                                        visible: previewImage.source == "" && rasterItem.sourcePath == ""
                                         anchors.centerIn: parent
                                         color: "gray"
                                         font.pixelSize: 18
@@ -405,8 +460,9 @@ ApplicationWindow {
                                         onDropped: (drop) => {
                                             if (drop.hasUrls) {
                                                 inputRasterPath = urlToLocalPath(drop.urls[0].toString())
-                                                processorInterface.previewRaster(inputRasterPath)
-                                                previewImage.scale = 1.0 // Reset zoom
+                                                loadingIndicator.running = true
+                                                rasterLoadTimer.start()
+                                                previewContainer.currentZoom = 1.0 // Reset zoom
                                                 flickable.contentX = 0
                                                 flickable.contentY = 0
                                             }
@@ -430,12 +486,13 @@ ApplicationWindow {
             spacing: 10
             
             Label {
+                id: statusLabel
                 text: " Ready"
                 verticalAlignment: Image.AlignVCenter
                 font.pixelSize: 12
             }
             ProgressBar {
-                visible: false
+                visible: value > 0 && value < 100
                 Layout.rightMargin: 10
                 Layout.leftMargin: 10
                 id: progressBar

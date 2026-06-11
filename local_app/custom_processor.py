@@ -714,27 +714,28 @@ class ForagesROIsDetector():
         epsg = None
         if filepath.lower().endswith('.tif') or filepath.lower().endswith('.tiff'):
             is_raster = True
-            with rio.open(filepath) as src:
-                bounds = src.bounds
-                extent = bounds  # (left, bottom, right, top)
-                crs = src.crs
-                if crs:
-                    if crs.is_epsg_code:
-                        epsg = crs.to_string().replace("EPSG:EPSG:", "EPSG:")
-                    elif crs.to_epsg() is not None:
-                        epsg = f"EPSG:{crs.to_epsg()}"
-                        epsg = crs.to_string().replace("EPSG:EPSG:", "EPSG:")
-                    else:
-                        raise ValueError(f"Could not determine EPSG code for file: {filepath}")
-                else:
-                    raise ValueError(f"No CRS found in raster file: {filepath}")
+            ds = gdal.Open(filepath)
+            if ds is None:
+                raise ValueError(f"Could not open raster file: {filepath}")
+            gt = ds.GetGeoTransform()
+            width = ds.RasterXSize
+            height = ds.RasterYSize
+            
+            left = gt[0]
+            top = gt[3]
+            right = left + width * gt[1] + height * gt[2]
+            bottom = top + width * gt[4] + height * gt[5]
+            extent = (min(left, right), min(bottom, top), max(left, right), max(bottom, top))
+            
+            epsg = ds.GetProjection()
+            if not epsg:
+                raise ValueError(f"No CRS found in raster file: {filepath}")
+            ds = None
         else:
             # extent and epsg must be provided or set elsewhere for non-tif images
             raise ValueError("EPSG code must be provided for non-tif images.")
         
-        epsg = crs.to_string().replace("EPSG:EPSG:", "EPSG:")
-        epsg = crs.to_string().replace("EPSG:", "")
-        print(epsg)
+        print("Projection / EPSG:", epsg)
 
         img_prec, scale, (h0, w0) = preprocess(np_image)
         outputs = self.ort_sess.run(None, {'images':img_prec})
@@ -799,7 +800,7 @@ class ForagesROIsDetector():
                                 , progress_callback=progress_callback
                                 , interruption_check=interruption_check
                                 )
-    def tile_inference(self, input_filepath, output_filepath, only=False, clean_cache=False):
+    def tile_inference(self, input_filepath, output_filepath, only=False, clean_cache=False, progress_callback=None, interruption_check=None):
 
         # Get basename without extension
         basename = os.path.splitext(os.path.basename(output_filepath))[0]
@@ -834,7 +835,7 @@ class ForagesROIsDetector():
             print(f"Using cached tiles from {images_dir}")
 
         # Process each tile
-        self.batch_processing(images_dir, shp_dir)
+        self.batch_processing(images_dir, shp_dir, progress_callback=progress_callback, interruption_check=interruption_check)
 
         # Merge all shapefiles in shp_dir and save
         shp_files = glob.glob(os.path.join(shp_dir, "*.shp"))
