@@ -18,7 +18,7 @@ MODEL_PATH = "./models"
 MODEL_FILENAME = "forages_rois_yolo_full_1024.onnx"
 
 # Preprocess image
-def preprocess(np_img, imgsz=1024):
+def preprocess(np_img, imgsz=1024, pad_color=114, debug_path=None):
 
     img = np_img
     
@@ -28,10 +28,14 @@ def preprocess(np_img, imgsz=1024):
     resized = cv.resize(img, new_size, interpolation=cv.INTER_LINEAR)
 
     # Padding
-    padded = np.full((imgsz, imgsz, 3), 114, dtype=np.uint8)
-    padded[:resized.shape[0], :resized.shape[1]] = resized
+    padded = np.full((imgsz, imgsz, 3), pad_color, dtype=np.uint8)
+    
+    pad_w = (imgsz - new_size[0]) // 2
+    pad_h = (imgsz - new_size[1]) // 2
+    padded[pad_h:pad_h+new_size[1], pad_w:pad_w+new_size[0]] = resized
 
-    #cv.imwrite("padded_img.jpg", cv.cvtColor(padded, cv.COLOR_RGB2BGR))
+    if debug_path:
+        cv.imwrite(debug_path, cv.cvtColor(padded, cv.COLOR_RGB2BGR))
 
     img_input = padded.astype(np.float32) / 255.0
     img_input = img_input.transpose(2, 0, 1)  # HWC to CHW
@@ -129,38 +133,143 @@ def postprocess_yolo_output(outputs, conf_threshold=0.3, nms_threshold=0.5, inpu
 
     return [[final_boxes], [final_classes]]
 
+def postprocess_yolov8_output(outputs, conf_threshold=0.3, nms_threshold=0.5, input_size=1024, orig_shape=(1024, 1024)):
+    """
+    Convert raw YOLOv8/v11 ONNX output (1, 4+C, N) or (1, N, 4+C) to bboxes and class IDs using NMS.
+    """
+    output = outputs[0]  
+    output = np.squeeze(output, axis=0)  
+    
+    # YOLOv8/11 exports can be (4+C, N) or (N, 4+C). We want (N, 4+C).
+    if output.shape[0] < output.shape[1]:
+        output = output.transpose(1, 0)
+        
+    print(f"[DEBUG] Postprocessing YOLOv11 output. Shape after transpose: {output.shape}")
+
+    # Check if this is an End2End ONNX export with NMS already applied
+    is_end2end = output.shape[1] == 6
+    
+    if is_end2end:
+        boxes_xyxy = output[:, :4]
+        confidences = output[:, 4]
+        class_ids = output[:, 5].astype(np.int32)
+        
+        mask = confidences > conf_threshold
+        final_boxes = boxes_xyxy[mask]
+        final_classes = class_ids[mask]
+        final_scores = confidences[mask]
+        
+        if len(final_boxes) == 0:
+            return [[np.zeros((0, 5))], [np.zeros((0,), dtype=np.int32)]]
+            
+        # Undo letterbox scaling
+        gain = input_size / max(orig_shape)
+        pad_x = (input_size - orig_shape[1] * gain) / 2
+        pad_y = (input_size - orig_shape[0] * gain) / 2
+        final_boxes[:, [0, 2]] -= pad_x
+        final_boxes[:, [1, 3]] -= pad_y
+        final_boxes /= gain
+        final_boxes = np.clip(final_boxes, 0, [orig_shape[1], orig_shape[0], orig_shape[1], orig_shape[0]])
+        
+        final_boxes = np.concatenate([final_boxes, final_scores[:, None]], axis=1)  # (N, 5)
+        return [[final_boxes], [final_classes]]
+
+    boxes_xywh = output[:, :4]
+    scores = output[:, 4:]  # shape (N, num_classes)
+    
+    class_ids = np.argmax(scores, axis=1)
+    confidences = np.max(scores, axis=1)
+    
+    print(f"[DEBUG] Max confidence found in raw outputs: {confidences.max() if len(confidences) > 0 else 0}")
+
+    # Filter by confidence
+    mask = confidences > conf_threshold
+    boxes_xywh = boxes_xywh[mask]
+    class_ids = class_ids[mask]
+    confidences = confidences[mask]
+
+    if len(boxes_xywh) == 0:
+        return [[np.zeros((0, 5))], [np.zeros((0,), dtype=np.int32)]]
+
+    # Convert to xyxy and scale
+    boxes_xyxy = xywh2xyxy(boxes_xywh)
+
+    # Undo letterbox scaling
+    gain = input_size / max(orig_shape)
+    pad_x = (input_size - orig_shape[1] * gain) / 2
+    pad_y = (input_size - orig_shape[0] * gain) / 2
+    boxes_xyxy[:, [0, 2]] -= pad_x
+    boxes_xyxy[:, [1, 3]] -= pad_y
+    boxes_xyxy /= gain
+    boxes_xyxy = np.clip(boxes_xyxy, 0, [orig_shape[1], orig_shape[0], orig_shape[1], orig_shape[0]])
+
+    # Prepare final lists
+    final_boxes_list = []
+    final_scores_list = []
+    final_classes_list = []
+
+    # NMS per class
+    for cls in np.unique(class_ids):
+        cls_mask = class_ids == cls
+        cls_boxes = boxes_xyxy[cls_mask]
+        cls_scores = confidences[cls_mask]
+
+        boxes_nms = cls_boxes.copy()
+        boxes_nms[:, 2] -= boxes_nms[:, 0]
+        boxes_nms[:, 3] -= boxes_nms[:, 1]
+
+        indices = cv.dnn.NMSBoxes(
+            bboxes=boxes_nms.tolist(),
+            scores=cls_scores.tolist(),
+            score_threshold=conf_threshold,
+            nms_threshold=nms_threshold
+        )
+
+        if len(indices) > 0:
+            indices = np.array(indices).flatten()
+            final_boxes_list.append(cls_boxes[indices])
+            final_scores_list.append(cls_scores[indices])
+            final_classes_list.append(np.full(len(indices), cls, dtype=np.int32))
+
+    if not final_boxes_list:
+        return [[np.zeros((0, 5))], [np.zeros((0,), dtype=np.int32)]]
+
+    final_boxes = np.concatenate(final_boxes_list, axis=0)
+    final_scores = np.concatenate(final_scores_list, axis=0)
+    final_classes = np.concatenate(final_classes_list, axis=0)
+
+    final_boxes = np.concatenate([final_boxes, final_scores[:, None]], axis=1)  # (N, 5)
+
+    return [[final_boxes], [final_classes]]
+
 def outputs_to_df(outputs):
     """
     Convert bounding boxes from the padded & resized image back to the original image coordinates.
-    
-    Parameters:
-        bboxes (list): List of bounding boxes as [x1, y1, x2, y2, score].
-        classes (list): List of corresponding class labels.
-        original_size (tuple): (height, width) of the original image.
-        target_size (tuple): (target_height, target_width) used for resizing/padding.
-    
-    Returns:
-        DataFrame: A pandas DataFrame with columns [xmin, ymin, xmax, ymax, score, class].
     """
-
     bboxes = outputs[0][0]
     classes = outputs[1][0]
+    
+    has_polygons = len(outputs) >= 3
+    polygons = outputs[2][0] if has_polygons else None
 
     results = []
-    for bbox, label in zip(bboxes, classes):
+    for i, (bbox, label) in enumerate(zip(bboxes, classes)):
         x1, y1, x2, y2, score = bbox
 
-        
-        results.append({
+        row = {
             "xmin": x1,
             "ymin": y1,
             "xmax": x2,
             "ymax": y2,
             "score": score,
             "class": label
-        })
+        }
         
-    # Convert the list of dictionaries to a pandas DataFrame
+        if has_polygons and polygons[i] is not None:
+            row["polygon"] = polygons[i]
+            
+        results.append(row)
+        
     df = pd.DataFrame(results)
     return df
 
@@ -236,20 +345,36 @@ def save_shapefile_bb(df, extent, img_width, img_height, epsg_or_proj, allow_col
     valid_df = []
     
     for index, detection in df.iterrows():
-        xmin = detection["xmin"]
-        ymin = detection["ymin"]
-        xmax = detection["xmax"]
-        ymax = detection["ymax"]
-        new_contour = [(xmin, ymin), (xmax, ymin), (xmax, ymax), (xmin, ymax)]
-        coord_polygon = []
-        for point in new_contour:
-            coord = (point[0], point[1])
-            new_coord = pos2coords(coord, extent, img_width, img_height)
-            coord_polygon.append(new_coord)
-        
-        if len(coord_polygon) > 2:
-            coord_polygons.append(coord_polygon)
-            valid_df.append(detection)
+        if "polygon" in detection and detection["polygon"] is not None:
+            polygon_pts = detection["polygon"]
+            coord_polygon = []
+            for pt in polygon_pts:
+                coord = (pt[0], pt[1])
+                new_coord = pos2coords(coord, extent, img_width, img_height)
+                coord_polygon.append(new_coord)
+            if len(coord_polygon) > 2:
+                # Explicitly close the polygon to prevent it from looking 'clipped' or broken in GIS software
+                if coord_polygon[0] != coord_polygon[-1]:
+                    coord_polygon.append(coord_polygon[0])
+                coord_polygons.append(coord_polygon)
+                valid_df.append(detection)
+        else:
+            xmin = detection["xmin"]
+            ymin = detection["ymin"]
+            xmax = detection["xmax"]
+            ymax = detection["ymax"]
+            new_contour = [(xmin, ymin), (xmax, ymin), (xmax, ymax), (xmin, ymax)]
+            coord_polygon = []
+            for point in new_contour:
+                coord = (point[0], point[1])
+                new_coord = pos2coords(coord, extent, img_width, img_height)
+                coord_polygon.append(new_coord)
+            
+            if len(coord_polygon) > 2:
+                if coord_polygon[0] != coord_polygon[-1]:
+                    coord_polygon.append(coord_polygon[0])
+                coord_polygons.append(coord_polygon)
+                valid_df.append(detection)
             
     if output_filename is not None and coord_polygons:
         valid_df_obj = pd.DataFrame(valid_df)
@@ -601,7 +726,7 @@ def merge_shp_gdal(shp_paths, output_path, dissolve=False, explode=False, nms=Fa
     ds_out = None
     return output_path
 
-def tile_raster_gdal(input_raster_path, tiles_dir, tile_size, prefix=""):
+def tile_raster_gdal(input_raster_path, tiles_dir, tile_size, prefix="", crop_shapefile=None):
     from osgeo import gdal
     src_ds = gdal.Open(input_raster_path)
     if src_ds is None:
@@ -618,15 +743,47 @@ def tile_raster_gdal(input_raster_path, tiles_dir, tile_size, prefix=""):
     tile_files = []
     tile_count = 0
     nodata_value = -9999
+    
+    crop_geom = None
+    if crop_shapefile and os.path.exists(crop_shapefile):
+        ds_shp = ogr.Open(crop_shapefile)
+        if ds_shp:
+            layer = ds_shp.GetLayer()
+            crop_geom = ogr.Geometry(ogr.wkbMultiPolygon)
+            for feature in layer:
+                geom = feature.GetGeometryRef()
+                if geom:
+                    crop_geom.AddGeometry(geom.Clone())
+            ds_shp = None
     for row in range(tiles_y):
         for col in range(tiles_x):
+            x_offset = col * tile_size
+            y_offset = row * tile_size
+            
+            # Check crop shapefile intersection
+            if crop_geom:
+                minx = geotransform[0] + x_offset * geotransform[1]
+                maxy = geotransform[3] + y_offset * geotransform[5]
+                maxx = minx + tile_size * geotransform[1]
+                miny = maxy + tile_size * geotransform[5]
+                
+                ring = ogr.Geometry(ogr.wkbLinearRing)
+                ring.AddPoint(minx, miny)
+                ring.AddPoint(maxx, miny)
+                ring.AddPoint(maxx, maxy)
+                ring.AddPoint(minx, maxy)
+                ring.AddPoint(minx, miny)
+                tile_poly = ogr.Geometry(ogr.wkbPolygon)
+                tile_poly.AddGeometry(ring)
+                
+                if not crop_geom.Intersects(tile_poly):
+                    continue
+                    
             tile_filename = os.path.join(tiles_dir, f"{prefix}{tile_count:05d}.tif")
             if os.path.exists(tile_filename):
                 tile_files.append(tile_filename)
                 tile_count += 1
                 continue
-            x_offset = col * tile_size
-            y_offset = row * tile_size
             x_size = min(tile_size, width - x_offset)
             y_size = min(tile_size, height - y_offset)
             tile_geotransform = list(geotransform)
@@ -666,12 +823,12 @@ class ForagesROIsDetector():
 
         pass
 
-    def initialize(self):
+    def initialize(self, model_filename=MODEL_FILENAME):
 
         #Load model
-        if self.ort_sess is None:            
+        if self.ort_sess is None or getattr(self, "current_model_filename", None) != model_filename:            
 
-            model_filepath = os.path.join(MODEL_PATH, MODEL_FILENAME)
+            model_filepath = os.path.join(MODEL_PATH, model_filename)
 
             providers = [
                 ("CUDAExecutionProvider", {
@@ -685,6 +842,7 @@ class ForagesROIsDetector():
             ]
 
             self.ort_sess = ort.InferenceSession(model_filepath, providers=providers)
+            self.current_model_filename = model_filename
 
             # self.ort_sess = ort.InferenceSession(model_filepath
             #                     ,providers=ort.get_available_providers()
@@ -692,9 +850,9 @@ class ForagesROIsDetector():
 
         return
     
-    def inference(self, filepath, output_folder=None):
+    def inference(self, filepath, output_folder=None, model_filename=MODEL_FILENAME, output_filename=None):
 
-        self.initialize()
+        self.initialize(model_filename)
 
         # Get basename without extension
         basename = os.path.splitext(os.path.basename(filepath))[0]
@@ -744,7 +902,7 @@ class ForagesROIsDetector():
 
         if is_raster:
 
-            shp_bbox = os.path.join(output_folder, basename + "_boxes.shp")
+            shp_bbox = output_filename if output_filename else os.path.join(output_folder, basename + "_boxes.shp")
 
             print("Saving shapefile to", shp_bbox)
 
@@ -800,6 +958,83 @@ class ForagesROIsDetector():
                                 , progress_callback=progress_callback
                                 , interruption_check=interruption_check
                                 )
+                                
+    def crop_inference(self, input_filepath, output_filepath, progress_callback=None, interruption_check=None):
+        if progress_callback: progress_callback({"progress": 10, "status": "Running crop detection model..."})
+        
+        self.initialize("crop_detection.onnx")
+        
+        basename = os.path.splitext(os.path.basename(input_filepath))[0]
+        output_folder = os.path.dirname(output_filepath)
+        os.makedirs(output_folder, exist_ok=True)
+        
+        from osgeo import gdal
+        ds = gdal.Open(input_filepath)
+        if ds is None:
+            raise ValueError(f"Could not open raster file: {input_filepath}")
+            
+        gt = ds.GetGeoTransform()
+        width = ds.RasterXSize
+        height = ds.RasterYSize
+        
+        left = gt[0]
+        top = gt[3]
+        right = left + width * gt[1] + height * gt[2]
+        bottom = top + width * gt[4] + height * gt[5]
+        extent = (min(left, right), min(bottom, top), max(left, right), max(bottom, top))
+        
+        epsg = ds.GetProjection()
+        if not epsg:
+            raise ValueError(f"No CRS found in raster file: {input_filepath}")
+            
+        imgsz = 640
+        r = imgsz / max(width, height)
+        new_w = int(width * r)
+        new_h = int(height * r)
+        
+        img_array = ds.ReadAsArray(0, 0, width, height, buf_xsize=new_w, buf_ysize=new_h)
+        ds = None
+        
+        import numpy as np
+        import cv2 as cv
+        
+        if len(img_array.shape) >= 3:
+            np_image = np.stack([img_array[0], img_array[1], img_array[2]], axis=-1)
+        else:
+            np_image = np.stack([img_array, img_array, img_array], axis=-1)
+            
+        if np_image.dtype != np.uint8:
+            np_image = cv.normalize(np_image, None, 0, 255, cv.NORM_MINMAX, dtype=cv.CV_8U)
+            
+        debug_path = os.path.join(output_folder, basename + "_debug_crop_padded.jpg")
+        img_prec, scale, (h0, w0) = preprocess(np_image, imgsz=imgsz, pad_color=114, debug_path=debug_path)
+        
+        outputs = self.ort_sess.run(None, {'images':img_prec})
+        
+        conf_threshold = 0.25
+        nms_threshold = 0.7
+        
+        if len(outputs) >= 2:
+            import yolo_seg_util
+            outputs = yolo_seg_util.postprocess_yolov8_seg_output(outputs, conf_threshold=conf_threshold, nms_threshold=nms_threshold, input_size=imgsz, orig_shape=(new_h, new_w))
+        else:
+            outputs = postprocess_yolov8_output(outputs, conf_threshold=conf_threshold, nms_threshold=nms_threshold, input_size=imgsz, orig_shape=(new_h, new_w))
+            
+        boxes_df = outputs_to_df(outputs)
+        
+        shp_bbox = output_filepath if output_filepath else os.path.join(output_folder, basename + "_crops.shp")
+        
+        save_shapefile_bb(boxes_df,
+                            extent,
+                            new_w,
+                            new_h,
+                            epsg,
+                            allow_cols=["score","class"],
+                            output_filename=shp_bbox
+                            )
+                            
+        if progress_callback: progress_callback({"progress": 100, "status": "Crop detection complete."})
+
     def tile_inference(self, input_filepath, output_filepath, only=False, clean_cache=False, progress_callback=None, interruption_check=None):
 
         # Get basename without extension
@@ -875,5 +1110,139 @@ class ForagesROIsDetector():
         # Post process the merged shapefile
         label_polygons_from_shapefile(safe_input_filepath, safe_input_output_filepath, serpentine=serpentine, row_tol=1.0, min_ratio=1/1.8, max_ratio=1.8, iou_thresh=0.15, align_to_grid=align_to_grid, only_postprocess=only_postprocess)
 
+    def tile_inference_on_crop(self, input_filepath, output_filepath, crop_shapefile, only=False, clean_cache=False, progress_callback=None, interruption_check=None):
+        basename = os.path.splitext(os.path.basename(output_filepath))[0]
+        output_folder = os.path.dirname(output_filepath)
+        
+        try: from cachemanager import CacheManager
+        except ImportError: from .cachemanager import CacheManager
+        cache_manager = CacheManager(project_path=output_folder)
+        
+        tile_size = 1024
+        cache_key = {"input_raster_path": input_filepath, "tile_size": tile_size, "crop_mask": crop_shapefile}
+        key = cache_manager.compute_key(cache_key)
+        
+        images_dir = cache_manager.get_cache_folder_path("tiles", key)
+        shp_dir = cache_manager.get_cache_folder_path("shp", key)
+        os.makedirs(output_folder, exist_ok=True)
 
+        if not cache_manager.exists("tiles", key):
+            print(f"Extracting tiles from {input_filepath} over crops to cache...")
+            tile_raster_gdal(input_filepath, images_dir, tile_size, prefix="tile_", crop_shapefile=crop_shapefile)
+        else:
+            print(f"Using cached crop tiles from {images_dir}")
 
+        self.batch_processing(images_dir, shp_dir, progress_callback=progress_callback, interruption_check=interruption_check)
+
+        shp_files = glob.glob(os.path.join(shp_dir, "*.shp"))
+        print(f"Merging {len(shp_files)} files")
+
+        if shp_files:
+            merged_dir = cache_manager.get_cache_folder_path("merged", key)
+            merged_shp = os.path.join(merged_dir, "merged.shp")
+            merge_shp_gdal(shp_files, merged_shp)
+
+            safe_path = os.path.normpath(output_filepath)
+            label_polygons_from_shapefile_by_crop(merged_shp, safe_path, crop_shapefile, serpentine=True, row_tol=1.0, min_ratio=1/1.8, max_ratio=1.8, iou_thresh=0.15)
+            
+            if clean_cache:
+                cache_manager.clean_cache_folder_path("tiles", key)
+                cache_manager.clean_cache_folder_path("shp", key)
+                cache_manager.clean_cache_folder_path("merged", key)
+        else:
+            print("No shapefiles found to merge in", shp_dir)
+
+def label_polygons_from_shapefile_by_crop(input_shp, output_shp, crop_shp, serpentine=True, row_tol=1.0, min_ratio=1/1.8, max_ratio=1.8, iou_thresh=0.15):
+    from osgeo import ogr
+    import shapely.wkt
+    import shapely.geometry
+    import os
+    
+    driver = ogr.GetDriverByName("ESRI Shapefile")
+    ds_in = driver.Open(input_shp)
+    if not ds_in: return
+    layer_in = ds_in.GetLayer()
+    srs = layer_in.GetSpatialRef()
+    
+    # Load crop polygons
+    ds_crop = driver.Open(crop_shp)
+    crop_polys = []
+    if ds_crop:
+        layer_crop = ds_crop.GetLayer()
+        for feat in layer_crop:
+            geom = feat.GetGeometryRef()
+            if geom:
+                crop_polys.append(shapely.wkt.loads(geom.ExportToWkt()))
+        ds_crop = None
+
+    # Load plants
+    plants = []
+    layer_defn = layer_in.GetLayerDefn()
+    field_count = layer_defn.GetFieldCount()
+    for feat in layer_in:
+        geom = feat.GetGeometryRef()
+        if geom:
+            wkt = geom.ExportToWkt()
+            fields = [feat.GetField(i) for i in range(field_count)]
+            plants.append((wkt, fields))
+    ds_in = None
+
+    # Process per crop
+    final_labeled_plants = []
+    
+    for crop_id, crop_poly in enumerate(crop_polys, start=1):
+        crop_wkt_list = []
+        crop_fields_list = []
+        for wkt, fields in plants:
+            plant_poly = shapely.wkt.loads(wkt)
+            if crop_poly.contains(plant_poly.centroid) or crop_poly.intersects(plant_poly):
+                crop_wkt_list.append(wkt)
+                crop_fields_list.append(fields)
+                
+        if not crop_wkt_list:
+            continue
+            
+        crop_wkt_list, crop_fields_list = filter_by_aspect_ratio(crop_wkt_list, crop_fields_list, min_ratio, max_ratio)
+        crop_wkt_list, crop_fields_list = polygon_nms_gdal(crop_wkt_list, crop_fields_list, iou_thresh)
+        
+        if not crop_wkt_list:
+            continue
+            
+        polys = [shapely.wkt.loads(wkt) for wkt in crop_wkt_list]
+        centroids = np.array([poly.centroid.coords[0] for poly in polys])
+        
+        clean_centroids = remove_outlier_centroids(centroids, threshold=4.0)
+        angle = estimate_grid_angle(clean_centroids)
+        projected = project_to_grid_axes_angle(centroids, angle)
+        rows = group_rows_cols(projected, row_tol=row_tol)
+        idx_map = assign_indices(rows, serpentine)
+        
+        labels = []
+        for c in centroids:
+            proj_c = project_to_grid_axes_angle(np.array([c]), angle, center=centroids.mean(axis=0))[0]
+            best_match = min(idx_map.keys(), key=lambda k: np.linalg.norm(np.array(k) - proj_c))
+            labels.append(idx_map[best_match])
+            
+        for label, wkt, fields in zip(labels, crop_wkt_list, crop_fields_list):
+            final_labeled_plants.append((crop_id, label, wkt, fields))
+
+    if os.path.exists(output_shp): driver.DeleteDataSource(output_shp)
+    ds_out = driver.CreateDataSource(output_shp)
+    layer_out = ds_out.CreateLayer("labeled", srs, ogr.wkbPolygon)
+    
+    layer_out.CreateField(ogr.FieldDefn("crop_id", ogr.OFTInteger))
+    layer_out.CreateField(ogr.FieldDefn("grid_id", ogr.OFTInteger))
+    for i in range(field_count):
+        layer_out.CreateField(layer_defn.GetFieldDefn(i))
+        
+    for crop_id, grid_id, wkt, fields in final_labeled_plants:
+        geom = ogr.CreateGeometryFromWkt(wkt)
+        feat = ogr.Feature(layer_out.GetLayerDefn())
+        feat.SetField("crop_id", crop_id)
+        feat.SetField("grid_id", grid_id)
+        for i, val in enumerate(fields):
+            feat.SetField(layer_defn.GetFieldDefn(i).GetName(), val)
+        feat.SetGeometry(geom)
+        layer_out.CreateFeature(feat)
+        feat = None
+    ds_out = None

@@ -47,43 +47,21 @@ def run_gui():
     import os
     os.environ["QT_QUICK_CONTROLS_STYLE"] = "Fusion"
 
-    #from PySide6.QtWidgets import QApplication
-    #from PySide6.QtGui import QIcon
-    #from PySide6.QtQml import QQmlApplicationEngine
-    from PySide6.QtGui import QGuiApplication
+    # Set explicit AppUserModelID on Windows so taskbar uses the app icon
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("CIAT.TropicalForages.ForagesROIs.1.0")
+        except Exception:
+            pass
+
+    from PySide6.QtWidgets import QApplication, QSplashScreen
+    from PySide6.QtGui import QIcon, QPixmap
     from PySide6.QtQml import QQmlApplicationEngine, qmlRegisterType
-    from PySide6.QtCore import QUrl
-    from PySide6.QtCore import Qt
+    from PySide6.QtCore import QUrl, Qt, QTimer
     from interface.raster_preview_item import RasterPreviewItem
 
-    #pp = QApplication(sys.argv)
-
-    
-
-    processorInterface = ProcessorInterface()
-    
-    # engine = QQmlApplicationEngine()
-    # engine.quit.connect(app.quit)
-    # engine.rootContext().setContextProperty("processorInterface", processorInterface)
-    
-    # # Load the new view.qml
-    # qml_path = os.path.join(os.path.dirname(__file__), "view.qml")
-    
-    # # Ensure URL formatting for QML engine
-    # if os.name == 'nt':
-    #     qml_url = "file:///" + qml_path.replace("\\", "/")
-    # else:
-    #     qml_url = "file://" + qml_path
-
-    # engine.load(qml_url)
-
-    # if not engine.rootObjects():
-    #     print("QML load failed")
-    #     sys.exit(1)
-
-    # sys.exit(app.exec())
-
-    app = QGuiApplication(sys.argv)
+    app = QApplication(sys.argv)
 
     app.setApplicationName("ForagesROIs")
     app.setOrganizationName("Tropical Forages Program | Alliance Bioversity International & CIAT")
@@ -91,12 +69,48 @@ def run_gui():
 
     app.styleHints().setColorScheme(Qt.ColorScheme.Light)
 
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    icon_path = os.path.join(base_dir, "icon.png")
+    if os.path.exists(icon_path):
+        app.setWindowIcon(QIcon(icon_path))
+
+    # Professional splash screen
+    splash = None
+    splash_path = os.path.join(base_dir, "splash.png")
+    if os.path.exists(splash_path):
+        pixmap = QPixmap(splash_path)
+        splash = QSplashScreen(pixmap, Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint)
+        splash.show()
+        app.processEvents()
+
+    processorInterface = ProcessorInterface()
+
     qmlRegisterType(RasterPreviewItem, "CustomComponents", 1, 0, "RasterPreviewItem")
 
     engine = QQmlApplicationEngine()
     engine.quit.connect(app.quit)
     engine.rootContext().setContextProperty("processorInterface", processorInterface)
-    engine.load(QUrl("view.qml"))
+
+    qml_path = os.path.join(base_dir, "view.qml")
+    engine.load(QUrl.fromLocalFile(qml_path))
+
+    root_objects = engine.rootObjects()
+    if not root_objects:
+        print("QML load failed")
+        if splash:
+            splash.close()
+        sys.exit(1)
+
+    # Smooth splash screen transition
+    if splash:
+        main_win = root_objects[0]
+        def close_splash():
+            splash.close()
+            main_win.show()
+            main_win.raise_()
+            main_win.requestActivate()
+
+        QTimer.singleShot(1800, close_splash)
 
     sys.exit(app.exec())
 

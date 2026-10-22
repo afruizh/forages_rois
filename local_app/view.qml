@@ -19,6 +19,7 @@ ApplicationWindow {
 
     property string inputRasterPath: ""
     property string outputFolderPath: ""
+    property string inputCropShapefilePath: ""
 
     function urlToLocalPath(urlStr) {
         if (urlStr.startsWith("file:////")) {
@@ -145,6 +146,15 @@ ApplicationWindow {
         }
     }
 
+    FileDialog {
+        id: cropFileDialog
+        title: qsTr("Please choose a crop shapefile")
+        nameFilters: ["Shapefiles (*.shp)", "All files (*)"]
+        onAccepted: {
+            inputCropShapefilePath = urlToLocalPath(cropFileDialog.currentFile.toString())
+        }
+    }
+
     MessageDialog {
         id: infoDialog
         title: qsTr("Process Completed")
@@ -159,6 +169,13 @@ ApplicationWindow {
         }
     }
 
+    MessageDialog {
+        id: errorDialog
+        title: qsTr("Process Error")
+        text: qsTr("An error occurred during processing.")
+        buttons: MessageDialog.Ok
+    }
+
     Connections {
         target: processorInterface
         function onProgressUpdated(info) {
@@ -167,6 +184,12 @@ ApplicationWindow {
             }
             if (info.status !== undefined) {
                 statusLabel.text = info.status
+            }
+        }
+        function onFinished(info) {
+            if (info.status === "error") {
+                errorDialog.text = info.message || "An unknown error occurred."
+                errorDialog.open()
             }
         }
         function onVisualizationReady(imagePath) {
@@ -257,6 +280,31 @@ ApplicationWindow {
                                             }
                                         }
 
+                                        // Crop Shapefile Selection (Optional)
+                                        ColumnLayout {
+                                            Layout.fillWidth: true
+                                            spacing: 5
+                                            visible: taskCombo.currentText === "tiling_detection_on_crop"
+                                            Label { text: "Crop Shapefile (Optional):"; font.bold: true }
+                                            RowLayout {
+                                                Layout.fillWidth: true
+                                                TextField {
+                                                    text: inputCropShapefilePath
+                                                    placeholderText: "Select crop shapefile or leave blank to auto-detect..."
+                                                    Layout.fillWidth: true
+                                                    readOnly: true
+                                                }
+                                                Button {
+                                                    text: "..."
+                                                    onClicked: cropFileDialog.open()
+                                                }
+                                                Button {
+                                                    text: "X"
+                                                    onClicked: inputCropShapefilePath = ""
+                                                }
+                                            }
+                                        }
+
                                         // Output Folder Selection
                                         ColumnLayout {
                                             Layout.fillWidth: true
@@ -285,7 +333,7 @@ ApplicationWindow {
                                             ComboBox {
                                                 id: taskCombo
                                                 Layout.fillWidth: true
-                                                model: ["tiling_detection", "plot_numbering", "postprocessing"]
+                                                model: ["tiling_detection", "crop_detection", "tiling_detection_on_crop", "plot_numbering", "postprocessing"]
                                             }
                                         }
 
@@ -312,7 +360,8 @@ ApplicationWindow {
                                                         "task": taskCombo.currentText,
                                                         "input_file": inputRasterPath,
                                                         "output_folder": outputFolderPath,
-                                                        "use_vector_overlay": useVectorOverlayCheckbox.checked
+                                                        "use_vector_overlay": useVectorOverlayCheckbox.checked,
+                                                        "crop_shapefile": inputCropShapefilePath
                                                     }
                                                     processorInterface.process(params)
                                                 }

@@ -124,6 +124,7 @@ conda activate forages_rois
 - [X] Cache System
 - [X] Migration rasterio to gdal
 - [X] Migration geopandas to gdal
+- [ ] Adding crop detector model
 
 ## License
 

@@ -20,12 +20,18 @@ class Worker(QThread):
     def run(self):
         """Long-running task."""
         import time
+        import traceback
         print("Processing started...")
 
-        processor = Processor(self.params
-                              , progress_callback = self.progressUpdated.emit
-                              , interruption_check = self.isInterruptionRequested)
-        results = processor.run()
+        try:
+            processor = Processor(self.params
+                                  , progress_callback = self.progressUpdated.emit
+                                  , interruption_check = self.isInterruptionRequested)
+            results = processor.run()
+        except Exception as e:
+            traceback.print_exc()
+            results = {"status": "error", "message": str(e)}
+            self.progressUpdated.emit({"status": "Error occurred.", "progress": 0})
 
         if not self.isInterruptionRequested():
             print("Processing finished!")
@@ -85,8 +91,9 @@ class ProcessorInterface(QObject):
         self.finished.emit(info)
         print("Process finished signal emitted.")
         
-        # Try to generate visualization
-        self.generateVisualization()
+        # Try to generate visualization only if successful
+        if info.get("status") != "error":
+            self.generateVisualization()
 
         # Clean up worker reference
         self.worker = None
@@ -157,11 +164,24 @@ class ProcessorInterface(QObject):
                 
             basename = os.path.splitext(os.path.basename(input_raster))[0]
             
+            task = self.last_params.get("task", "")
+            
             if output_folder.lower().endswith(".shp"):
                 output_shp = output_folder
             else:
-                # We expect custom_processor.tile_inference to write to output_folder/basename.shp or similar
-                output_shp = os.path.join(output_folder, f"{basename}.shp")
+                if task == "crop_detection":
+                    output_shp = os.path.join(output_folder, f"{basename}_crops.shp")
+                elif task == "detection":
+                    output_shp = os.path.join(output_folder, f"{basename}_boxes.shp")
+                elif task == "tiling_detection_on_crop":
+                    output_shp = os.path.join(output_folder, f"{basename}_on_crop.shp")
+                elif task == "plot_numbering":
+                    output_shp = os.path.join(output_folder, f"{basename}_numbering.shp")
+                elif task == "postprocessing":
+                    output_shp = os.path.join(output_folder, f"{basename}_postprocess.shp")
+                else:
+                    output_shp = os.path.join(output_folder, f"{basename}.shp")
+                    
                 if not os.path.exists(output_shp):
                     output_shp = os.path.join(output_folder, "merged.shp")
             

@@ -172,3 +172,17 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# Deep Learning Models & Weights
+*.onnx
+*.pt
+*.pth
+*.weights
+**/models/*.onnx
+
+# Runtime Cache & Geospatial Temp Files
+.cache_forages_rois/
+_temp_raster.tif
+
+# Qt Resource Compilations
+rc_resources.py

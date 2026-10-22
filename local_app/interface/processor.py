@@ -51,6 +51,63 @@ class Processor():
 
             results.update({"status": "completed", "message": "Task completed succesfully."})
 
+        elif task == "crop_detection":
+
+            import os
+            input_file = self.params.get("input_file")
+            output_folder = self.params.get("output_folder")
+            
+            if not output_folder.lower().endswith(".shp"):
+                basename = os.path.splitext(os.path.basename(input_file))[0]
+                output_filepath = os.path.join(output_folder, basename + "_crops.shp")
+            else:
+                output_filepath = output_folder
+
+            self.forages_rois_detector = ForagesROIsDetector()
+            
+            if os.path.exists(output_filepath):
+                print(f"Output already exists, skipping inference: {output_filepath}")
+            else:
+                self.forages_rois_detector.crop_inference(input_file, output_filepath, progress_callback=self.progress_callback, interruption_check=self.interruption_check)
+
+            results.update({"status": "completed", "message": "Task completed succesfully."})
+
+        elif task == "tiling_detection_on_crop":
+
+            import os
+            input_file = self.params.get("input_file")
+            output_folder = self.params.get("output_folder")
+            crop_shapefile = self.params.get("crop_shapefile")
+            
+            basename = os.path.splitext(os.path.basename(input_file))[0]
+            if not crop_shapefile:
+                if not output_folder.lower().endswith(".shp"):
+                    crop_shapefile = os.path.join(output_folder, basename + "_crops.shp")
+                else:
+                    crop_shapefile = os.path.join(os.path.dirname(output_folder), basename + "_crops.shp")
+
+            if not output_folder.lower().endswith(".shp"):
+                output_filepath = os.path.join(output_folder, basename + "_on_crop.shp")
+            else:
+                output_filepath = output_folder
+
+            if not os.path.exists(crop_shapefile):
+                error_msg = f"Error: Crop shapefile not found at {crop_shapefile}"
+                print(error_msg)
+                if self.progress_callback:
+                    self.progress_callback({"status": error_msg, "progress": 0})
+                results.update({"status": "error", "message": error_msg})
+                return results
+
+            self.forages_rois_detector = ForagesROIsDetector()
+            
+            if os.path.exists(output_filepath):
+                print(f"Output already exists, skipping inference: {output_filepath}")
+            else:
+                self.forages_rois_detector.tile_inference_on_crop(input_file, output_filepath, crop_shapefile, progress_callback=self.progress_callback, interruption_check=self.interruption_check)
+
+            results.update({"status": "completed", "message": "Task completed succesfully."})
+
         elif task == "plot_numbering":
 
             import os
