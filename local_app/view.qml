@@ -20,6 +20,9 @@ ApplicationWindow {
     property string inputRasterPath: ""
     property string outputFolderPath: ""
     property string inputCropShapefilePath: ""
+    property string inputShapefilePath: ""
+    // Tasks that work on a detections shapefile instead of the raster
+    property bool vectorTask: taskCombo.currentText === "plot_numbering" || taskCombo.currentText === "postprocessing"
 
     function urlToLocalPath(urlStr) {
         if (urlStr.startsWith("file:////")) {
@@ -155,6 +158,15 @@ ApplicationWindow {
         }
     }
 
+    FileDialog {
+        id: shapefileDialog
+        title: qsTr("Please choose a detections shapefile")
+        nameFilters: ["Shapefiles (*.shp)", "All files (*)"]
+        onAccepted: {
+            inputShapefilePath = urlToLocalPath(shapefileDialog.currentFile.toString())
+        }
+    }
+
     MessageDialog {
         id: infoDialog
         title: qsTr("Process Completed")
@@ -187,16 +199,22 @@ ApplicationWindow {
             }
         }
         function onFinished(info) {
+            progressBar.value = 100
             if (info.status === "error") {
+                statusLabel.text = "Error"
                 errorDialog.text = info.message || "An unknown error occurred."
                 errorDialog.open()
+            } else {
+                // Show what actually happened (output path, or skipped because it already exists)
+                statusLabel.text = "Finished"
+                infoDialog.text = info.message || "The process has finished."
+                infoDialog.open()
             }
         }
         function onVisualizationReady(imagePath) {
             previewImage.source = "file:///" + imagePath + "?" + new Date().getTime()
             statusLabel.text = "Visualization Ready!"
             progressBar.value = 100
-            infoDialog.open()
         }
         function onRasterPreviewReady(imagePath) {
             previewImage.source = "file:///" + imagePath + "?" + new Date().getTime()
@@ -264,7 +282,7 @@ ApplicationWindow {
                                         ColumnLayout {
                                             Layout.fillWidth: true
                                             spacing: 5
-                                            Label { text: "Input Raster:"; font.bold: true }
+                                            Label { text: vectorTask ? "Input Raster (Optional, for preview):" : "Input Raster:"; font.bold: true }
                                             RowLayout {
                                                 Layout.fillWidth: true
                                                 TextField {
@@ -276,6 +294,27 @@ ApplicationWindow {
                                                 Button {
                                                     text: "..."
                                                     onClicked: fileDialog.open()
+                                                }
+                                            }
+                                        }
+
+                                        // Detections Shapefile Selection (numbering and postprocessing tasks)
+                                        ColumnLayout {
+                                            Layout.fillWidth: true
+                                            spacing: 5
+                                            visible: vectorTask
+                                            Label { text: "Input Shapefile:"; font.bold: true }
+                                            RowLayout {
+                                                Layout.fillWidth: true
+                                                TextField {
+                                                    text: inputShapefilePath
+                                                    placeholderText: "Select detections shapefile..."
+                                                    Layout.fillWidth: true
+                                                    readOnly: true
+                                                }
+                                                Button {
+                                                    text: "..."
+                                                    onClicked: shapefileDialog.open()
                                                 }
                                             }
                                         }
@@ -337,6 +376,33 @@ ApplicationWindow {
                                             }
                                         }
 
+                                        // Numbering Options (plot_numbering task)
+                                        ColumnLayout {
+                                            Layout.fillWidth: true
+                                            spacing: 5
+                                            visible: taskCombo.currentText === "plot_numbering"
+                                            Label { text: "Numbering:"; font.bold: true }
+                                            CheckBox {
+                                                id: serpentineCheckbox
+                                                text: "Serpentine"
+                                                checked: true
+                                            }
+                                            RowLayout {
+                                                Layout.fillWidth: true
+                                                Label { text: "Start corner:" }
+                                                ComboBox {
+                                                    id: startCornerCombo
+                                                    Layout.fillWidth: true
+                                                    model: ["NW", "NE", "SW", "SE"]
+                                                }
+                                            }
+                                            CheckBox {
+                                                id: swapAxesCheckbox
+                                                text: "Swap rows and columns"
+                                                checked: false
+                                            }
+                                        }
+
                                         // Process Button
                                         ColumnLayout {
                                             Layout.fillWidth: true
@@ -346,6 +412,13 @@ ApplicationWindow {
                                                 id: useVectorOverlayCheckbox
                                                 text: "Use Native Vector Overlay (High Res)"
                                                 checked: true
+                                            }
+
+                                            CheckBox {
+                                                id: showRoisCheckbox
+                                                text: "Show ROIs layer"
+                                                checked: true
+                                                enabled: useVectorOverlayCheckbox.checked
                                             }
 
                                             Button {
@@ -361,7 +434,11 @@ ApplicationWindow {
                                                         "input_file": inputRasterPath,
                                                         "output_folder": outputFolderPath,
                                                         "use_vector_overlay": useVectorOverlayCheckbox.checked,
-                                                        "crop_shapefile": inputCropShapefilePath
+                                                        "crop_shapefile": inputCropShapefilePath,
+                                                        "input_shapefile": inputShapefilePath,
+                                                        "serpentine": serpentineCheckbox.checked,
+                                                        "start_corner": startCornerCombo.currentText,
+                                                        "swap_axes": swapAxesCheckbox.checked
                                                     }
                                                     processorInterface.process(params)
                                                 }
@@ -442,7 +519,7 @@ ApplicationWindow {
                                         contentX: flickable.contentX
                                         contentY: flickable.contentY
                                         zoomScale: previewContainer.currentZoom
-                                        showVectorOverlay: true
+                                        showVectorOverlay: showRoisCheckbox.checked
                                     }
 
                                     Flickable {

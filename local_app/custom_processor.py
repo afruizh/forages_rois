@@ -1128,6 +1128,18 @@ class ForagesROIsDetector():
             # Save dataframe boxes_df
             boxes_df.to_csv(csv_filename, index=False)
 
+    @staticmethod
+    def tile_progress(progress_callback):
+        """Convert BatchProcessor progress ("percent") to the GUI format ("progress", "status").
+        Tiles take 5 to 90 % of the bar; the rest is tile extraction, merging and numbering."""
+        if not progress_callback:
+            return None
+        def callback(info):
+            done, total = info.get("processed_count", 0), info.get("total_files", 0)
+            progress_callback({"progress": 5 + 0.85 * info.get("percent", 0),
+                               "status": f"Detecting plants: tile {done} of {total}"})
+        return callback
+
     def batch_processing(self, folder, output_folder, format="tif"
                         , progress_callback=None
                         , interruption_check=None
@@ -1265,6 +1277,7 @@ class ForagesROIsDetector():
         os.makedirs(output_folder, exist_ok=True)
 
         # Extract tiles and save using GDAL
+        if progress_callback: progress_callback({"progress": 2, "status": "Extracting tiles..."})
         if not cache_manager.exists("tiles", key):
             print(f"Extracting tiles from {input_filepath} to cache...")
             tile_raster_gdal(input_filepath, images_dir, tile_size, prefix="tile_")
@@ -1272,11 +1285,12 @@ class ForagesROIsDetector():
             print(f"Using cached tiles from {images_dir}")
 
         # Process each tile
-        self.batch_processing(images_dir, shp_dir, progress_callback=progress_callback, interruption_check=interruption_check)
+        self.batch_processing(images_dir, shp_dir, progress_callback=self.tile_progress(progress_callback), interruption_check=interruption_check)
 
         # Merge all shapefiles in shp_dir and save
         shp_files = glob.glob(os.path.join(shp_dir, "*.shp"))
         print(f"Merging {len(shp_files)} files")
+        if progress_callback: progress_callback({"progress": 92, "status": "Merging tiles and numbering plants..."})
 
         if shp_files:
             merged_dir = cache_manager.get_cache_folder_path("merged", key)
@@ -1330,16 +1344,18 @@ class ForagesROIsDetector():
         shp_dir = cache_manager.get_cache_folder_path("shp", key)
         os.makedirs(output_folder, exist_ok=True)
 
+        if progress_callback: progress_callback({"progress": 2, "status": "Extracting tiles over crops..."})
         if not cache_manager.exists("tiles", key):
             print(f"Extracting tiles from {input_filepath} over crops to cache...")
             tile_raster_gdal(input_filepath, images_dir, tile_size, prefix="tile_", crop_shapefile=crop_shapefile)
         else:
             print(f"Using cached crop tiles from {images_dir}")
 
-        self.batch_processing(images_dir, shp_dir, progress_callback=progress_callback, interruption_check=interruption_check)
+        self.batch_processing(images_dir, shp_dir, progress_callback=self.tile_progress(progress_callback), interruption_check=interruption_check)
 
         shp_files = glob.glob(os.path.join(shp_dir, "*.shp"))
         print(f"Merging {len(shp_files)} files")
+        if progress_callback: progress_callback({"progress": 92, "status": "Merging tiles and numbering plants..."})
 
         if shp_files:
             merged_dir = cache_manager.get_cache_folder_path("merged", key)

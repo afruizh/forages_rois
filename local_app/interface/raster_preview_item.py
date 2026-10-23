@@ -4,7 +4,7 @@ import cv2
 from osgeo import gdal, ogr
 
 from PySide6.QtQuick import QQuickPaintedItem
-from PySide6.QtGui import QImage, QColor, QPainter, QPolygonF, QPen
+from PySide6.QtGui import QImage, QColor, QPainter, QPolygonF, QPen, QFont, QPainterPath, QFontMetricsF
 from PySide6.QtCore import Property, QRectF, QPointF, Signal, Slot, Qt
 
 class RasterPreviewItem(QQuickPaintedItem):
@@ -29,7 +29,9 @@ class RasterPreviewItem(QQuickPaintedItem):
         self._inv_gt = None
         
         self._polygons = []
-        
+        self._labels = []             # (centroid in raster pixels, text) for numbered layers
+        self._label_min_zoom = 1.0    # zoom from which polygons are big enough to read labels
+
         self.setRenderTarget(QQuickPaintedItem.FramebufferObject)
 
     @Property(str)
@@ -126,6 +128,7 @@ class RasterPreviewItem(QQuickPaintedItem):
 
     def load_shapefile(self):
         self._polygons = []
+        self._labels = []
         if not self._shapefilePath or not os.path.exists(self._shapefilePath):
             return
             
@@ -139,7 +142,11 @@ class RasterPreviewItem(QQuickPaintedItem):
         layer = shp_ds.GetLayer()
         if not layer:
             return
-            
+
+        # Numbered layers get a grid_id label per polygon
+        has_grid = layer.GetLayerDefn().GetFieldIndex("grid_id") >= 0
+        widths = []
+
         for feature in layer:
             geom = feature.GetGeometryRef()
             if geom is not None:
@@ -154,8 +161,20 @@ class RasterPreviewItem(QQuickPaintedItem):
                         py = self._inv_gt[3] + self._inv_gt[4]*x + self._inv_gt[5]*y
                         points.append(QPointF(px, py))
                     if points:
-                        self._polygons.append(QPolygonF(points))
-                        
+                        poly = QPolygonF(points)
+                        self._polygons.append(poly)
+                        widths.append(poly.boundingRect().width())
+                        grid_id = feature.GetField("grid_id") if has_grid else None
+                        if grid_id:  # 0 or empty means not numbered
+                            c = geom.Centroid()
+                            cx = self._inv_gt[0] + self._inv_gt[1]*c.GetX() + self._inv_gt[2]*c.GetY()
+                            cy = self._inv_gt[3] + self._inv_gt[4]*c.GetX() + self._inv_gt[5]*c.GetY()
+                            self._labels.append((QPointF(cx, cy), str(grid_id)))
+
+        # Show labels only when a typical polygon is at least about 30 screen pixels wide
+        if widths:
+            self._label_min_zoom = 30.0 / max(float(np.median(widths)), 1e-6)
+
     def paint(self, painter: QPainter):
         if not self._dataset or self._raster_w == 0 or self._raster_h == 0:
             return
@@ -222,8 +241,9 @@ class RasterPreviewItem(QQuickPaintedItem):
             # Then translate back by the source offset
             painter.translate(-src_x, -src_y)
             
-            pen = QPen(QColor(0, 255, 0))
-            pen.setWidthF(2.0 / self._zoomScale) # Keep stroke width visually constant regardless of zoom
+            # Light blue borders only (no fill), same style as QGIS_STYLE in processor.py
+            pen = QPen(QColor(90, 190, 255))
+            pen.setWidthF(2.5 / self._zoomScale) # Keep stroke width visually constant regardless of zoom
             pen.setJoinStyle(Qt.RoundJoin)
             painter.setPen(pen)
             painter.setBrush(Qt.NoBrush)
@@ -234,5 +254,27 @@ class RasterPreviewItem(QQuickPaintedItem):
             for poly in self._polygons:
                 # Optionally, we could clip to the visible rectangle to avoid drawing offscreen polygons
                 painter.drawPolygon(poly)
-                
+
+            painter.restore()
+
+        # Draw numbering labels in screen coordinates so the text keeps a constant size
+        if self._showVectorOverlay and self._labels and self._zoomScale >= self._label_min_zoom:
+            painter.save()
+            painter.setRenderHint(QPainter.Antialiasing)
+            font = QFont()
+            font.setPixelSize(14)
+            font.setBold(True)
+            metrics = QFontMetricsF(font)
+            halo = QPen(QColor(40, 40, 40, 220), 3.0)  # dark halo keeps white text readable
+            halo.setJoinStyle(Qt.RoundJoin)
+            for pt, text in self._labels:
+                sx = (pt.x() - src_x) * self._zoomScale
+                sy = (pt.y() - src_y) * self._zoomScale
+                if 0 <= sx <= w and 0 <= sy <= h:
+                    # White text centred on the polygon, drawn as a path to get the halo
+                    path = QPainterPath()
+                    path.addText(sx - metrics.horizontalAdvance(text) / 2,
+                                 sy + (metrics.ascent() - metrics.descent()) / 2, font, text)
+                    painter.strokePath(path, halo)
+                    painter.fillPath(path, QColor(255, 255, 255))
             painter.restore()

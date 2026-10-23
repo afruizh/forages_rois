@@ -88,6 +88,7 @@ class ProcessorInterface(QObject):
     @Slot(dict)
     def onProcessFinished(self, info):
         """Handle the process completion."""
+        self.last_results = info  # holds "output_file" for the visualization
         self.finished.emit(info)
         print("Process finished signal emitted.")
         
@@ -166,7 +167,11 @@ class ProcessorInterface(QObject):
             
             task = self.last_params.get("task", "")
             
-            if output_folder.lower().endswith(".shp"):
+            # Prefer the output path reported by the processor; fall back to the naming convention
+            output_shp = (getattr(self, "last_results", None) or {}).get("output_file")
+            if output_shp and os.path.exists(output_shp):
+                pass
+            elif output_folder.lower().endswith(".shp"):
                 output_shp = output_folder
             else:
                 if task == "crop_detection":
