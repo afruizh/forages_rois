@@ -563,6 +563,210 @@ def assign_indices(rows, serpentine=False):
     return index_map
 
 
+# --- Plot numbering ---
+# assign_grid_ids() numbers plant centroids in sequential steps:
+#   1. Convert centroids to metres (local UTM zone) when the layer CRS is geographic,
+#      so every distance below is in metres whatever the input CRS.
+#   2. Find the row direction from the angles between each plant and its nearest neighbours.
+#   3. Measure the spacing between plants in a row and between rows from the same neighbours.
+#   4. Rotate the centroids so rows run along the u axis and are stacked along the v axis.
+#   5. Trace rows: cut the field into short strips along u, split each strip into row pieces
+#      wherever the gap along v is larger than half the row spacing, and link the pieces
+#      strip by strip. Then refine the angle from the slope of those rows and trace again.
+#   6. Split plants into columns the same way along u.
+#   7. Number row by row from the start corner, reversing every other row for serpentine.
+# Rows with very few plants (isolated detections) are left out of the numbering (ids 0),
+# so they do not shift the serpentine order of the real rows.
+
+def centroids_to_metres(points, srs):
+    """Step 1: return the points in metres; geographic coordinates go to the local UTM zone."""
+    if srs is None or not srs.IsGeographic():
+        return points.copy()
+    lon, lat = points.mean(axis=0)
+    zone = int((lon + 180) // 6) + 1
+    utm = osr.SpatialReference()
+    utm.ImportFromEPSG((32600 if lat >= 0 else 32700) + zone)
+    src = srs.Clone()
+    src.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    utm.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    transform = osr.CoordinateTransformation(src, utm)
+    return np.array(transform.TransformPoints(points.tolist()))[:, :2]
+
+def nearest_neighbours(points, k):
+    """Indices of the k nearest neighbours of each point, computed in chunks to limit memory."""
+    n = len(points)
+    k = min(k, n - 1)
+    idx = np.empty((n, k), dtype=int)
+    for start in range(0, n, 1024):
+        stop = min(start + 1024, n)
+        d = ((points[start:stop, None, :] - points[None, :, :]) ** 2).sum(-1)
+        d[np.arange(stop - start), np.arange(start, stop)] = np.inf
+        idx[start:stop] = np.argpartition(d, k - 1, axis=1)[:, :k]
+    return idx
+
+def estimate_row_direction(points, neighbours, closest=2):
+    """Step 2: dominant angle (degrees, 0 to 180) of the links between each plant and its
+    `closest` nearest neighbours. Only the closest links are used: they lie along the row,
+    while farther neighbours add the across-row and diagonal directions."""
+    vec = points[neighbours] - points[:, None, :]
+    dist = np.hypot(vec[..., 0], vec[..., 1])
+    nearest = np.argsort(dist, axis=1)[:, :closest]
+    vec = np.take_along_axis(vec, nearest[..., None], axis=1).reshape(-1, 2)
+    ang = np.degrees(np.arctan2(vec[:, 1], vec[:, 0])) % 180
+    hist, _ = np.histogram(ang, bins=180, range=(0, 180))
+    hist = hist + np.roll(hist, 1) + np.roll(hist, -1)  # circular smoothing
+    peak = np.argmax(hist) + 0.5
+    # Refine the peak with the mean of the angles within 10 degrees of it (doubled angles, since 0 = 180)
+    diff = (ang - peak + 90) % 180 - 90
+    sel = np.radians(2 * diff[np.abs(diff) < 10])
+    return peak + np.degrees(np.arctan2(np.sin(sel).mean(), np.cos(sel).mean())) / 2
+
+def link_spacing(points, neighbours, direction, max_angle=20):
+    """Step 3: median distance to the closest neighbour lying along a direction (unit vector).
+    Returns None when too few plants have a neighbour in that direction."""
+    vec = points[neighbours] - points[:, None, :]
+    length = np.hypot(vec[..., 0], vec[..., 1])
+    cos = np.abs(vec @ direction) / np.maximum(length, 1e-12)
+    length = np.where(cos >= np.cos(np.radians(max_angle)), length, np.inf)
+    closest = length.min(axis=1)
+    closest = closest[np.isfinite(closest)]
+    return float(np.median(closest)) if len(closest) >= 10 else None
+
+def split_by_gaps(values, min_gap):
+    """Steps 5 and 6: group 1D values, starting a new group wherever the gap exceeds min_gap.
+    Groups are numbered from 0 in increasing order of value."""
+    order = np.argsort(values)
+    breaks = np.diff(values[order]) > min_gap
+    groups = np.empty(len(values), dtype=int)
+    groups[order] = np.concatenate([[0], np.cumsum(breaks)])
+    return groups
+
+def trace_rows(u, v, plant_spacing, row_spacing, strip_plants=6):
+    """Step 5: assign each plant to a row.
+    Splitting the whole field at once fails on long rows: small drift or curvature makes
+    neighbouring rows touch somewhere along their length. Instead the field is cut into
+    strips across the rows (about `strip_plants` plants long), rows are split by gaps inside
+    each strip, and the pieces are linked strip by strip to the row with the closest v.
+    Returns row labels numbered from 0 in increasing order of v."""
+    max_dv = 0.5 * row_spacing
+    strip = np.floor((u - u.min()) / (strip_plants * plant_spacing)).astype(int)
+    labels = np.full(len(u), -1)
+    active_v = []  # last known v of each row traced so far
+    for s in np.unique(strip):
+        idx = np.flatnonzero(strip == s)
+        pieces = split_by_gaps(v[idx], max_dv)
+        piece_v = np.array([v[idx[pieces == p]].mean() for p in range(pieces.max() + 1)])
+        # Link pieces to rows one to one, closest pairs first; unlinked pieces start new rows
+        pairs = sorted((abs(pv - rv), p, r) for p, pv in enumerate(piece_v)
+                       for r, rv in enumerate(active_v) if abs(pv - rv) < max_dv)
+        piece_row, used_rows = {}, set()
+        for _, p, r in pairs:
+            if p not in piece_row and r not in used_rows:
+                piece_row[p] = r
+                used_rows.add(r)
+        for p, pv in enumerate(piece_v):
+            if p not in piece_row:
+                piece_row[p] = len(active_v)
+                active_v.append(pv)
+            active_v[piece_row[p]] = pv
+            labels[idx[pieces == p]] = piece_row[p]
+    # Renumber rows by mean v so that row 0 is the southmost
+    mean_v = np.array([v[labels == r].mean() for r in range(len(active_v))])
+    rank = np.empty(len(mean_v), dtype=int)
+    rank[np.argsort(mean_v)] = np.arange(len(mean_v))
+    return rank[labels]
+
+def assign_grid_ids(centroids, srs=None, serpentine=True, start_corner="NW", swap_axes=False,
+                    k=8, min_row_fraction=0.1):
+    """Number plant centroids row by row (see the step list above).
+
+    centroids: (N, 2) array in the layer CRS.
+    start_corner: "NW", "NE", "SW" or "SE". The first letter picks the first row (northmost or
+        southmost), the second letter the end of that row where numbering starts.
+    swap_axes: use when the detected rows are actually the columns of the trial.
+    Returns grid_id, row and col arrays (1 based; 0 for plants left out of the grid).
+    """
+    n = len(centroids)
+    grid_id = np.zeros(n, dtype=int)
+    row = np.zeros(n, dtype=int)
+    col = np.zeros(n, dtype=int)
+    if n < 3:
+        grid_id[np.argsort(centroids[:, 0])] = np.arange(1, n + 1)
+        return grid_id, row, col
+
+    # Step 1: metres
+    pts = centroids_to_metres(np.asarray(centroids, dtype=float), srs)
+    pts = pts - pts.mean(axis=0)
+
+    # Step 2: row direction d (pointing east) and its normal nrm (pointing north)
+    neighbours = nearest_neighbours(pts, k)
+    theta = np.radians(estimate_row_direction(pts, neighbours))
+    d = np.array([np.cos(theta), np.sin(theta)])
+    if swap_axes:
+        d = np.array([-d[1], d[0]])
+
+    def orient(d):
+        d = d if d[0] >= 0 else -d
+        nrm = np.array([-d[1], d[0]])
+        return d, (nrm if nrm[1] >= 0 else -nrm)
+    d, nrm = orient(d)
+
+    # Step 3: spacing in a row and between rows. If no neighbour lies across the rows
+    # (rows far apart), twice the in-row spacing is a safe threshold for splitting rows.
+    plant_spacing = link_spacing(pts, neighbours, d) or link_spacing(pts, neighbours, d, max_angle=90)
+    row_spacing = link_spacing(pts, neighbours, nrm) or 2 * plant_spacing
+
+    # Steps 4 and 5: rotate, split rows, refine the angle with the median row slope, split again
+    for refine in (True, False):
+        u, v = pts @ d, pts @ nrm
+        rows = trace_rows(u, v, plant_spacing, row_spacing)
+        if not refine:
+            break
+        slopes = []
+        for r in np.unique(rows):
+            m = rows == r
+            if m.sum() >= 3 and np.ptp(u[m]) > 2 * plant_spacing:
+                slopes.append(np.polyfit(u[m], v[m], 1)[0])
+        if slopes:
+            # Tilt d towards nrm by the residual slope of the rows
+            a = np.arctan(np.median(slopes))
+            d, nrm = orient(np.cos(a) * d + np.sin(a) * nrm)
+
+    # Leave out rows with very few plants (isolated detections outside the trial)
+    counts = np.bincount(rows)
+    keep = counts >= max(2, min_row_fraction * np.median(counts))
+    valid_rows = np.flatnonzero(keep)
+
+    # Step 6: columns along u (meaningful when plants of different rows are aligned)
+    cols = split_by_gaps(u, 0.5 * plant_spacing)
+
+    # Step 7: numbering. v grows to the north and u to the east.
+    north_first = start_corner.upper().startswith("N")
+    west_first = start_corner.upper().endswith("W")
+    row_order = valid_rows[::-1] if north_first else valid_rows
+    in_kept_rows = keep[rows]
+    used_cols = np.unique(cols[in_kept_rows])
+    col_rank = {c: i + 1 for i, c in enumerate(used_cols if west_first else used_cols[::-1])}
+
+    next_id = 1
+    for r_index, r in enumerate(row_order):
+        members = np.flatnonzero(rows == r)
+        members = members[np.argsort(u[members])]
+        if not west_first:
+            members = members[::-1]
+        if serpentine and r_index % 2 == 1:
+            members = members[::-1]
+        grid_id[members] = np.arange(next_id, next_id + len(members))
+        row[members] = r_index + 1
+        col[members] = [col_rank[c] for c in cols[members]]
+        next_id += len(members)
+
+    print(f"Numbering: row angle {np.degrees(np.arctan2(d[1], d[0])):.1f} deg, plant spacing "
+          f"{plant_spacing:.2f} m, row spacing {row_spacing:.2f} m, {len(valid_rows)} rows, "
+          f"{int((~in_kept_rows).sum())} plants left out")
+    return grid_id, row, col
+
+
 # --- Filtering functions ---
 def filter_by_aspect_ratio(wkt_list, fields_list, min_ratio=0.2, max_ratio=5.0):
     import shapely.wkt
@@ -617,7 +821,9 @@ def rotate_polygon_to_pca_axes(polygon, centroid, axes):
 
 # --- Main pipeline ---
 def label_polygons_from_shapefile(input_shp, output_shp, serpentine=False, row_tol=10,
-                                   iou_thresh=0.3, min_ratio=0.2, max_ratio=5.0, align_to_grid=False, only_postprocess=False):
+                                   iou_thresh=0.3, min_ratio=0.2, max_ratio=5.0, align_to_grid=False, only_postprocess=False,
+                                   start_corner="NW", swap_axes=False):
+    # row_tol and align_to_grid are kept for compatibility; numbering now uses assign_grid_ids()
     from osgeo import ogr, osr
     import shapely.wkt
     import shapely.geometry
@@ -649,41 +855,37 @@ def label_polygons_from_shapefile(input_shp, output_shp, serpentine=False, row_t
     if not only_postprocess and wkt_list:
         polys = [shapely.wkt.loads(wkt) for wkt in wkt_list]
         centroids = np.array([poly.centroid.coords[0] for poly in polys])
-        
-        clean_centroids = remove_outlier_centroids(centroids, threshold=4.0)
-        angle = estimate_grid_angle(clean_centroids)
-        
-        projected = project_to_grid_axes_angle(centroids, angle)
-        rows = group_rows_cols(projected, row_tol=1.0)
-        idx_map = assign_indices(rows, serpentine)
-        
-        labels = []
-        for c in centroids:
-            proj_c = project_to_grid_axes_angle(np.array([c]), angle, center=centroids.mean(axis=0))[0]
-            best_match = min(idx_map.keys(), key=lambda k: np.linalg.norm(np.array(k) - proj_c))
-            labels.append(idx_map[best_match])
-            
-        combined = list(zip(labels, wkt_list, fields_list))
-        combined.sort(key=lambda x: x[0])
-        labels, wkt_list, fields_list = zip(*combined) if combined else ([], [], [])
-        
+        grid_ids, rows, cols = assign_grid_ids(centroids, srs, serpentine=serpentine,
+                                               start_corner=start_corner, swap_axes=swap_axes)
+
+        # Write features in numbering order; plants left out of the grid (id 0) go last
+        order = sorted(range(len(wkt_list)), key=lambda i: (grid_ids[i] == 0, grid_ids[i]))
+        labels = [(int(grid_ids[i]), int(rows[i]), int(cols[i])) for i in order]
+        wkt_list = [wkt_list[i] for i in order]
+        fields_list = [fields_list[i] for i in order]
+
     if os.path.exists(output_shp):
         driver.DeleteDataSource(output_shp)
     ds_out = driver.CreateDataSource(output_shp)
     layer_out = ds_out.CreateLayer("labeled", srs, ogr.wkbPolygon)
-    
+
     for i in range(field_count):
         layer_out.CreateField(layer_defn.GetFieldDefn(i))
     if not only_postprocess:
-        layer_out.CreateField(ogr.FieldDefn("grid_id", ogr.OFTInteger))
-        
+        # Reuse the fields when renumbering a layer that already has them
+        for name in ("grid_id", "row", "col"):
+            if layer_out.FindFieldIndex(name, True) < 0:
+                layer_out.CreateField(ogr.FieldDefn(name, ogr.OFTInteger))
+
     for idx, (wkt, fields) in enumerate(zip(wkt_list, fields_list)):
         geom = ogr.CreateGeometryFromWkt(wkt)
         feat = ogr.Feature(layer_out.GetLayerDefn())
         for i, val in enumerate(fields):
             feat.SetField(i, val)
         if not only_postprocess:
-            feat.SetField("grid_id", labels[idx])
+            feat.SetField("grid_id", labels[idx][0])
+            feat.SetField("row", labels[idx][1])
+            feat.SetField("col", labels[idx][2])
         feat.SetGeometry(geom)
         layer_out.CreateFeature(feat)
         feat = None
@@ -1103,12 +1305,14 @@ class ForagesROIsDetector():
         else:
             print("No shapefiles found to merge in", shp_dir)
 
-    def plot_numbering(self, input_filepath, output_filepath, serpentine=True, align_to_grid=False, only_postprocess=False):
+    def plot_numbering(self, input_filepath, output_filepath, serpentine=True, align_to_grid=False, only_postprocess=False,
+                       start_corner="NW", swap_axes=False):
         safe_input_filepath = os.path.normpath(input_filepath)
-        safe_input_output_filepath = os.path.normpath(output_filepath)        
-        
+        safe_input_output_filepath = os.path.normpath(output_filepath)
+
         # Post process the merged shapefile
-        label_polygons_from_shapefile(safe_input_filepath, safe_input_output_filepath, serpentine=serpentine, row_tol=1.0, min_ratio=1/1.8, max_ratio=1.8, iou_thresh=0.15, align_to_grid=align_to_grid, only_postprocess=only_postprocess)
+        label_polygons_from_shapefile(safe_input_filepath, safe_input_output_filepath, serpentine=serpentine, row_tol=1.0, min_ratio=1/1.8, max_ratio=1.8, iou_thresh=0.15, align_to_grid=align_to_grid, only_postprocess=only_postprocess,
+                                      start_corner=start_corner, swap_axes=swap_axes)
 
     def tile_inference_on_crop(self, input_filepath, output_filepath, crop_shapefile, only=False, clean_cache=False, progress_callback=None, interruption_check=None):
         basename = os.path.splitext(os.path.basename(output_filepath))[0]
@@ -1152,7 +1356,9 @@ class ForagesROIsDetector():
         else:
             print("No shapefiles found to merge in", shp_dir)
 
-def label_polygons_from_shapefile_by_crop(input_shp, output_shp, crop_shp, serpentine=True, row_tol=1.0, min_ratio=1/1.8, max_ratio=1.8, iou_thresh=0.15):
+def label_polygons_from_shapefile_by_crop(input_shp, output_shp, crop_shp, serpentine=True, row_tol=1.0, min_ratio=1/1.8, max_ratio=1.8, iou_thresh=0.15,
+                                          start_corner="NW", swap_axes=False):
+    # row_tol is kept for compatibility; numbering now uses assign_grid_ids()
     from osgeo import ogr
     import shapely.wkt
     import shapely.geometry
@@ -1210,38 +1416,35 @@ def label_polygons_from_shapefile_by_crop(input_shp, output_shp, crop_shp, serpe
             
         polys = [shapely.wkt.loads(wkt) for wkt in crop_wkt_list]
         centroids = np.array([poly.centroid.coords[0] for poly in polys])
-        
-        clean_centroids = remove_outlier_centroids(centroids, threshold=4.0)
-        angle = estimate_grid_angle(clean_centroids)
-        projected = project_to_grid_axes_angle(centroids, angle)
-        rows = group_rows_cols(projected, row_tol=row_tol)
-        idx_map = assign_indices(rows, serpentine)
-        
-        labels = []
-        for c in centroids:
-            proj_c = project_to_grid_axes_angle(np.array([c]), angle, center=centroids.mean(axis=0))[0]
-            best_match = min(idx_map.keys(), key=lambda k: np.linalg.norm(np.array(k) - proj_c))
-            labels.append(idx_map[best_match])
-            
-        for label, wkt, fields in zip(labels, crop_wkt_list, crop_fields_list):
-            final_labeled_plants.append((crop_id, label, wkt, fields))
+        # Each crop field is numbered on its own, starting at 1
+        grid_ids, rows, cols = assign_grid_ids(centroids, srs, serpentine=serpentine,
+                                               start_corner=start_corner, swap_axes=swap_axes)
+
+        crop_labeled = list(zip(grid_ids, rows, cols, crop_wkt_list, crop_fields_list))
+        crop_labeled.sort(key=lambda x: (x[0] == 0, x[0]))  # numbering order, left out plants last
+        for grid_id, r, c, wkt, fields in crop_labeled:
+            final_labeled_plants.append((crop_id, int(grid_id), int(r), int(c), wkt, fields))
 
     if os.path.exists(output_shp): driver.DeleteDataSource(output_shp)
     ds_out = driver.CreateDataSource(output_shp)
     layer_out = ds_out.CreateLayer("labeled", srs, ogr.wkbPolygon)
-    
-    layer_out.CreateField(ogr.FieldDefn("crop_id", ogr.OFTInteger))
-    layer_out.CreateField(ogr.FieldDefn("grid_id", ogr.OFTInteger))
+
+    for name in ("crop_id", "grid_id", "row", "col"):
+        layer_out.CreateField(ogr.FieldDefn(name, ogr.OFTInteger))
     for i in range(field_count):
-        layer_out.CreateField(layer_defn.GetFieldDefn(i))
-        
-    for crop_id, grid_id, wkt, fields in final_labeled_plants:
+        if layer_out.FindFieldIndex(layer_defn.GetFieldDefn(i).GetName(), True) < 0:
+            layer_out.CreateField(layer_defn.GetFieldDefn(i))
+
+    for crop_id, grid_id, r, c, wkt, fields in final_labeled_plants:
         geom = ogr.CreateGeometryFromWkt(wkt)
         feat = ogr.Feature(layer_out.GetLayerDefn())
-        feat.SetField("crop_id", crop_id)
-        feat.SetField("grid_id", grid_id)
         for i, val in enumerate(fields):
             feat.SetField(layer_defn.GetFieldDefn(i).GetName(), val)
+        # Set the numbering last so it replaces any old values from the input layer
+        feat.SetField("crop_id", crop_id)
+        feat.SetField("grid_id", grid_id)
+        feat.SetField("row", r)
+        feat.SetField("col", c)
         feat.SetGeometry(geom)
         layer_out.CreateFeature(feat)
         feat = None

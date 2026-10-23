@@ -191,6 +191,8 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=str, help="Output for CLI processing (used only with --cli).")
     parser.add_argument("--align", action="store_true", help="Run in CLI mode.")
     parser.add_argument("--serpentine", action="store_true", help="Run in CLI mode.")
+    parser.add_argument("--start_corner", type=str, choices=["NW", "NE", "SW", "SE"], help="Corner where plot numbering starts (default NW).")
+    parser.add_argument("--swap_axes", action="store_true", help="Number along the other grid axis when rows are detected as columns.")
 
     args = parser.parse_args()
 

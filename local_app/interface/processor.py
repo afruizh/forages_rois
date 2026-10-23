@@ -130,7 +130,9 @@ class Processor():
             else:
                 self.forages_rois_detector.plot_numbering(input_file, output_filepath
                                                           , align_to_grid=align
-                                                          , serpentine=serpentine)
+                                                          , serpentine=serpentine
+                                                          , start_corner=self.params.get("start_corner") or "NW"
+                                                          , swap_axes=self.params.get("swap_axes", False))
 
             results.update({"status": "completed", "message": "Task completed succesfully."})
 
