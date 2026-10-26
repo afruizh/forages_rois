@@ -1,0 +1,30 @@
+# Environment for running and packaging the desktop app (local_app) with pyside6-deploy.
+# Separate from ../environment.yml (QGIS plugin development): that one has QGIS, which brings
+# conda's Qt, and conda-forge's PySide6 does not include pyside6-deploy. Here PySide6 comes
+# from pip (official wheels, which include pyside6-deploy) and nothing from conda uses Qt.
+#
+#   conda env create -f environment_app.yml
+#   conda activate forages_rois_app
+#   pyside6-deploy ForagesROIs.py --init
+name: forages_rois_app
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  # Geospatial (GDAL Python bindings, no Qt dependency)
+  - gdal=3.13
+  - numpy
+  - pandas
+  - shapely
+  # CUDA 12 and cuDNN 9 runtime used by onnxruntime-gpu
+  - cuda-version=12.9
+  - cuda-cudart
+  - libcublas
+  - libcufft
+  - cudnn=9
+  - pip
+  - pip:
+      # Do not install PySide6, pyqt or qgis from conda in this environment
+      - PySide6==6.11.1
+      - onnxruntime-gpu==1.22.0
+      - opencv-python-headless==4.11.0.86

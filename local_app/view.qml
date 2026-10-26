@@ -21,6 +21,10 @@ ApplicationWindow {
     property string outputFolderPath: ""
     property string inputCropShapefilePath: ""
     property string inputShapefilePath: ""
+    property bool modelsFromMenu: false  // show the models dialog even when all is ok
+
+    // Check the models folder at startup (warns if models are missing)
+    Component.onCompleted: processorInterface.loadModelsFolder()
     // Tasks that work on a detections shapefile instead of the raster
     property bool vectorTask: taskCombo.currentText === "plot_numbering" || taskCombo.currentText === "postprocessing"
 
@@ -39,8 +43,15 @@ ApplicationWindow {
     menuBar: MenuBar {
         Menu {
             title: qsTr("&File")
-            //MenuSeparator { }
-            Action { 
+            Action {
+                text: qsTr("Set &Models Folder...")
+                onTriggered: {
+                    modelsFolderDialog.currentFolder = "file:///" + processorInterface.getModelsFolder()
+                    modelsFolderDialog.open()
+                }
+            }
+            MenuSeparator { }
+            Action {
                 text: qsTr("&Quit") 
                 onTriggered: Qt.quit()
             }
@@ -167,6 +178,21 @@ ApplicationWindow {
         }
     }
 
+    FolderDialog {
+        id: modelsFolderDialog
+        title: qsTr("Please choose the folder that contains the models (.onnx)")
+        onAccepted: {
+            modelsFromMenu = true
+            processorInterface.setModelsFolder(urlToLocalPath(modelsFolderDialog.selectedFolder.toString()))
+        }
+    }
+
+    MessageDialog {
+        id: modelsDialog
+        title: qsTr("Models")
+        buttons: MessageDialog.Ok
+    }
+
     MessageDialog {
         id: infoDialog
         title: qsTr("Process Completed")
@@ -215,6 +241,16 @@ ApplicationWindow {
             previewImage.source = "file:///" + imagePath + "?" + new Date().getTime()
             statusLabel.text = "Visualization Ready!"
             progressBar.value = 100
+        }
+        function onModelsStatus(level, folder, message) {
+            statusLabel.text = level === "ok" ? " Ready. Models: " + folder : " Models " + level + ": " + folder
+            // At startup only problems are shown; from the menu the result is always shown
+            if (level !== "ok" || modelsFromMenu) {
+                modelsDialog.title = level === "ok" ? qsTr("Models") : (level === "warning" ? qsTr("Models Warning") : qsTr("Models Error"))
+                modelsDialog.text = message
+                modelsDialog.open()
+            }
+            modelsFromMenu = false
         }
         function onRasterPreviewReady(imagePath) {
             previewImage.source = "file:///" + imagePath + "?" + new Date().getTime()

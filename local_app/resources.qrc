@@ -1,5 +1,8 @@
 <RCC>
-    <qresource prefix="/plugins/foragesrois" >
+    <qresource prefix="/" >
+        <file>view.qml</file>
         <file>icon.png</file>
+        <file>splash.png</file>
+        <file alias="res/tf.png">../res/tf.png</file>
     </qresource>
 </RCC>

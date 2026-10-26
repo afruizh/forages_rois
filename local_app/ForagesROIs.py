@@ -1,11 +1,13 @@
 import os
 import sys
 # Add the directory of the executable to PATH at runtime if frozen
-if getattr(sys, 'frozen', False):
-    exe_dir = os.path.dirname(sys.executable)
-    
+# (sys.frozen is set by PyInstaller, __compiled__ by Nuitka)
+if getattr(sys, 'frozen', False) or "__compiled__" in globals():
+    exe_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+
     # Force correct environment
     os.environ["PROJ_LIB"] = os.path.join(exe_dir, "proj_dir", "share", "proj")
+    os.environ["PROJ_DATA"] = os.environ["PROJ_LIB"]  # name used by PROJ 9.1+
     os.environ["GDAL_DATA"] = os.path.join(exe_dir, "gdal_data")
     os.environ["PATH"] = exe_dir + os.pathsep + os.environ.get("PATH", "")
 
@@ -18,9 +20,6 @@ if getattr(sys, 'frozen', False):
         windll.kernel32.SetDllDirectoryW(exe_dir)
     except Exception as e:
         print("Failed to set DLL directory:", e)
-
-from pyproj import datadir
-print("proj.db path:", datadir.get_data_dir())
 
 import sys
 # import time
@@ -35,7 +34,7 @@ import argparse
 from interface.interface import ProcessorInterface
 
 
-USE_RESOURCES = False  # Set to True to use resources.qrc
+USE_RESOURCES = True  # Set to True to use resources.qrc
 
 RES_PREFIX = ""
 
@@ -43,7 +42,9 @@ if USE_RESOURCES:
     import rc_resources
     RES_PREFIX = ":/"
 
-def run_gui():
+def run_gui(input_path=None, output_folder=None):
+    """Start the GUI. input_path (raster or detections shapefile) and output_folder prefill the
+    form, e.g. when the app is opened from the QGIS plugin."""
     import os
     os.environ["QT_QUICK_CONTROLS_STYLE"] = "Fusion"
 
@@ -69,15 +70,20 @@ def run_gui():
 
     app.styleHints().setColorScheme(Qt.ColorScheme.Light)
 
+    # Icon, splash and view.qml come from resources.qrc (":/...") or from files next to this script
+    from PySide6.QtCore import QFile
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    icon_path = os.path.join(base_dir, "icon.png")
-    if os.path.exists(icon_path):
+    def res_path(name):
+        return RES_PREFIX + name if USE_RESOURCES else os.path.join(base_dir, name)
+
+    icon_path = res_path("icon.png")
+    if QFile.exists(icon_path):  # QFile also checks ":/" resource paths
         app.setWindowIcon(QIcon(icon_path))
 
     # Professional splash screen
     splash = None
-    splash_path = os.path.join(base_dir, "splash.png")
-    if os.path.exists(splash_path):
+    splash_path = res_path("splash.png")
+    if QFile.exists(splash_path):
         pixmap = QPixmap(splash_path)
         splash = QSplashScreen(pixmap, Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint)
         splash.show()
@@ -91,8 +97,10 @@ def run_gui():
     engine.quit.connect(app.quit)
     engine.rootContext().setContextProperty("processorInterface", processorInterface)
 
-    qml_path = os.path.join(base_dir, "view.qml")
-    engine.load(QUrl.fromLocalFile(qml_path))
+    if USE_RESOURCES:
+        engine.load(QUrl("qrc:/view.qml"))
+    else:
+        engine.load(QUrl.fromLocalFile(res_path("view.qml")))
 
     root_objects = engine.rootObjects()
     if not root_objects:
@@ -100,6 +108,18 @@ def run_gui():
         if splash:
             splash.close()
         sys.exit(1)
+
+    # Prefill the form from the command line (--input, --output without --cli)
+    root = root_objects[0]
+    if output_folder:
+        root.setProperty("outputFolderPath", os.path.normpath(output_folder))
+    if input_path:
+        input_path = os.path.normpath(input_path)
+        if input_path.lower().endswith(".shp"):
+            root.setProperty("inputShapefilePath", input_path)
+        else:
+            root.setProperty("inputRasterPath", input_path)
+            QTimer.singleShot(0, lambda: processorInterface.previewRaster(input_path))
 
     # Smooth splash screen transition
     if splash:
@@ -118,6 +138,7 @@ def run_cli(args):
     print("working")
 
     processorInterface = ProcessorInterface()
+    processorInterface.loadModelsFolder()  # same models folder as the GUI (saved setting or default)
 
     # parameters = {
     #     "task": "detection",
@@ -187,8 +208,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the application in GUI or CLI mode.")
     parser.add_argument("--cli", action="store_true", help="Run in CLI mode.")
     parser.add_argument("--task", type=str, help="Task performed for CLI processing (used only with --cli).")
-    parser.add_argument("--input", type=str, help="Input for CLI processing (used only with --cli).")
-    parser.add_argument("--output", type=str, help="Output for CLI processing (used only with --cli).")
+    parser.add_argument("--input", type=str, help="Input for CLI processing; without --cli it prefills the GUI input (raster or shapefile).")
+    parser.add_argument("--output", type=str, help="Output for CLI processing; without --cli it prefills the GUI output folder.")
     parser.add_argument("--align", action="store_true", help="Run in CLI mode.")
     parser.add_argument("--serpentine", action="store_true", help="Run in CLI mode.")
     parser.add_argument("--start_corner", type=str, choices=["NW", "NE", "SW", "SE"], help="Corner where plot numbering starts (default NW).")
@@ -207,7 +228,7 @@ if __name__ == "__main__":
             sys.exit(1)
         run_cli(args)
     else:
-        run_gui()
+        run_gui(input_path=args.input, output_folder=args.output)
 
 
 

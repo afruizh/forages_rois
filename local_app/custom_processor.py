@@ -1,4 +1,5 @@
 import os
+import sys
 import onnxruntime as ort
 import cv2 as cv
 import numpy as np
@@ -12,10 +13,23 @@ import datetime
 from interface.batchprocessor import BatchProcessor
 import glob
 
-MODEL_PATH = "./models"
+# Default models folder: "models" next to the script or the executable (not the working directory).
+# The GUI can change it with File > Set Models Folder (see ProcessorInterface.setModelsFolder).
+MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "models")
 #MODEL_PATH = r"\\CATALOGUE.CGIARAD.ORG\AcceleratedBreedingInitiative\1.Data\36. Dataset ROI\models"
 
 MODEL_FILENAME = "forages_rois_yolo_full_1024.onnx"
+CROP_MODEL_FILENAME = "crop_detection.onnx"
+
+# Models the app needs, with what each one is used for
+REQUIRED_MODELS = {
+    MODEL_FILENAME: "plant detection (tiling_detection, tiling_detection_on_crop)",
+    CROP_MODEL_FILENAME: "crop field detection (crop_detection)",
+}
+
+def missing_models(folder):
+    """Return the required model files that are not in folder."""
+    return [name for name in REQUIRED_MODELS if not os.path.isfile(os.path.join(folder, name))]
 
 # Preprocess image
 def preprocess(np_img, imgsz=1024, pad_color=114, debug_path=None):
@@ -392,7 +406,6 @@ def check_raster(input_file):
 import numpy as np
 from shapely.geometry import box
 from shapely.geometry import Polygon
-from sklearn.decomposition import PCA
 
 
 def compute_centroids(gdf):
@@ -483,9 +496,8 @@ def compute_pca_axes(points):
     The first row is the direction of maximum variance (usually horizontal),
     the second is orthogonal.
     """
-    pca = PCA(n_components=2)
-    pca.fit(points)
-    axes = pca.components_
+    # PCA axes from the SVD of the centred points (same as sklearn PCA components_)
+    _, _, axes = np.linalg.svd(points - points.mean(axis=0), full_matrices=False)
 
     # Optionally, flip axes for consistent orientation
     # Make first axis point right (positive x direction)
@@ -855,11 +867,21 @@ def label_polygons_from_shapefile(input_shp, output_shp, serpentine=False, row_t
     if not only_postprocess and wkt_list:
         polys = [shapely.wkt.loads(wkt) for wkt in wkt_list]
         centroids = np.array([poly.centroid.coords[0] for poly in polys])
-        grid_ids, rows, cols = assign_grid_ids(centroids, srs, serpentine=serpentine,
-                                               start_corner=start_corner, swap_axes=swap_axes)
 
-        # Write features in numbering order; plants left out of the grid (id 0) go last
-        order = sorted(range(len(wkt_list)), key=lambda i: (grid_ids[i] == 0, grid_ids[i]))
+        # Layers from tiling_detection_on_crop have a crop_id per field: number each field
+        # separately (ids restart at 1), as that task does, instead of one grid across fields
+        crop_index = layer_defn.GetFieldIndex("crop_id")
+        crop_ids = np.array([fields[crop_index] if crop_index >= 0 else 0 for fields in fields_list])
+        grid_ids = np.zeros(len(polys), dtype=int)
+        rows = np.zeros(len(polys), dtype=int)
+        cols = np.zeros(len(polys), dtype=int)
+        for crop in np.unique(crop_ids):
+            members = np.flatnonzero(crop_ids == crop)
+            grid_ids[members], rows[members], cols[members] = assign_grid_ids(
+                centroids[members], srs, serpentine=serpentine, start_corner=start_corner, swap_axes=swap_axes)
+
+        # Write features in numbering order (by field); plants left out of the grid (id 0) go last
+        order = sorted(range(len(wkt_list)), key=lambda i: (crop_ids[i], grid_ids[i] == 0, grid_ids[i]))
         labels = [(int(grid_ids[i]), int(rows[i]), int(cols[i])) for i in order]
         wkt_list = [wkt_list[i] for i in order]
         fields_list = [fields_list[i] for i in order]
@@ -928,7 +950,82 @@ def merge_shp_gdal(shp_paths, output_path, dissolve=False, explode=False, nms=Fa
     ds_out = None
     return output_path
 
-def tile_raster_gdal(input_raster_path, tiles_dir, tile_size, prefix="", crop_shapefile=None):
+# --- Tile overlap ---
+# Tiles overlap by TILE_OVERLAP pixels so that every plant appears whole in at least one tile
+# (a plant cut by a tile border would otherwise give two partial boxes or none). 128 px is about
+# 3.8 m at 3 cm/px, twice the size of a plant box (about 1.85 m, 62 px).
+# To avoid duplicates, each pixel of the orthomosaic has one owner tile: the tile whose core
+# (the tile minus TILE_OVERLAP / 2 on each inner side) contains it. A detection is kept only in
+# the tile that owns its box centre (keep_core_detections), so each plant comes from exactly one
+# tile, taken where it is far from the border. Polygon NMS still runs afterwards as a safety net.
+TILE_OVERLAP = 128
+
+def tile_grid(size, tile_size, overlap):
+    """Number of tiles and stride along one axis for a raster of `size` pixels."""
+    stride = tile_size - overlap
+    count = max(1, int(np.ceil((size - overlap) / stride)))
+    return count, stride
+
+def owner_tile(pixel, tile_size, overlap, count):
+    """Index of the tile whose core contains this pixel coordinate (along one axis)."""
+    stride = tile_size - overlap
+    return int(np.clip(np.floor((pixel - overlap / 2) / stride), 0, count - 1))
+
+def keep_core_detections(shp_files, images_dir, raster_path, tile_size, overlap, out_dir):
+    """Write copies of the per tile shapefiles keeping only detections whose box centre lies in
+    the core of their own tile. Returns the list of filtered shapefiles."""
+    from osgeo import gdal, ogr
+    src = gdal.Open(raster_path)
+    gt = src.GetGeoTransform()
+    inv_gt = gdal.InvGeoTransform(gt)
+    nx, _ = tile_grid(src.RasterXSize, tile_size, overlap)
+    ny, _ = tile_grid(src.RasterYSize, tile_size, overlap)
+    stride = tile_size - overlap
+    src = None
+    driver = ogr.GetDriverByName("ESRI Shapefile")
+    os.makedirs(out_dir, exist_ok=True)
+    kept_files, kept, dropped = [], 0, 0
+    for shp in shp_files:
+        name = os.path.basename(shp)
+        tile_tif = os.path.join(images_dir, name.replace("_boxes.shp", ".tif"))
+        tile_ds = gdal.Open(tile_tif)
+        if tile_ds is None:  # unknown tile: keep everything
+            kept_files.append(shp)
+            continue
+        tgt = tile_ds.GetGeoTransform()
+        tile_ds = None
+        col = int(round((tgt[0] - gt[0]) / gt[1] / stride))
+        row = int(round((tgt[3] - gt[3]) / gt[5] / stride))
+
+        ds_in = driver.Open(shp)
+        layer_in = ds_in.GetLayer()
+        out_path = os.path.join(out_dir, name)
+        if os.path.exists(out_path):
+            driver.DeleteDataSource(out_path)
+        ds_out = driver.CreateDataSource(out_path)
+        layer_out = ds_out.CreateLayer("core", layer_in.GetSpatialRef(), layer_in.GetGeomType())
+        defn = layer_in.GetLayerDefn()
+        for i in range(defn.GetFieldCount()):
+            layer_out.CreateField(defn.GetFieldDefn(i))
+        for feat in layer_in:
+            geom = feat.GetGeometryRef()
+            if geom is None:
+                continue
+            minx, maxx, miny, maxy = geom.GetEnvelope()
+            cx, cy = (minx + maxx) / 2, (miny + maxy) / 2
+            px = inv_gt[0] + inv_gt[1] * cx + inv_gt[2] * cy
+            py = inv_gt[3] + inv_gt[4] * cx + inv_gt[5] * cy
+            if owner_tile(px, tile_size, overlap, nx) == col and owner_tile(py, tile_size, overlap, ny) == row:
+                layer_out.CreateFeature(feat.Clone())
+                kept += 1
+            else:
+                dropped += 1
+        ds_in, ds_out = None, None
+        kept_files.append(out_path)
+    print(f"Tile overlap: kept {kept} detections, dropped {dropped} duplicated in overlaps")
+    return kept_files
+
+def tile_raster_gdal(input_raster_path, tiles_dir, tile_size, prefix="", crop_shapefile=None, overlap=0):
     from osgeo import gdal
     src_ds = gdal.Open(input_raster_path)
     if src_ds is None:
@@ -939,8 +1036,9 @@ def tile_raster_gdal(input_raster_path, tiles_dir, tile_size, prefix="", crop_sh
     geotransform = src_ds.GetGeoTransform()
     projection = src_ds.GetProjection()
     data_type = src_ds.GetRasterBand(1).DataType
-    tiles_x = int(np.ceil(width / tile_size))
-    tiles_y = int(np.ceil(height / tile_size))
+    # Tiles start every `stride` pixels, so neighbouring tiles share `overlap` pixels
+    tiles_x, stride = tile_grid(width, tile_size, overlap)
+    tiles_y, _ = tile_grid(height, tile_size, overlap)
     os.makedirs(tiles_dir, exist_ok=True)
     tile_files = []
     tile_count = 0
@@ -959,8 +1057,8 @@ def tile_raster_gdal(input_raster_path, tiles_dir, tile_size, prefix="", crop_sh
             ds_shp = None
     for row in range(tiles_y):
         for col in range(tiles_x):
-            x_offset = col * tile_size
-            y_offset = row * tile_size
+            x_offset = col * stride
+            y_offset = row * stride
             
             # Check crop shapefile intersection
             if crop_geom:
@@ -1028,9 +1126,12 @@ class ForagesROIsDetector():
     def initialize(self, model_filename=MODEL_FILENAME):
 
         #Load model
-        if self.ort_sess is None or getattr(self, "current_model_filename", None) != model_filename:            
+        if self.ort_sess is None or getattr(self, "current_model_filename", None) != model_filename:
 
             model_filepath = os.path.join(MODEL_PATH, model_filename)
+            if not os.path.exists(model_filepath):
+                raise FileNotFoundError(f"Model not found:\n{model_filepath}\n\n"
+                                        "Set the folder that contains the models in File > Set Models Folder.")
 
             providers = [
                 ("CUDAExecutionProvider", {
@@ -1176,7 +1277,7 @@ class ForagesROIsDetector():
     def crop_inference(self, input_filepath, output_filepath, progress_callback=None, interruption_check=None):
         if progress_callback: progress_callback({"progress": 10, "status": "Running crop detection model..."})
         
-        self.initialize("crop_detection.onnx")
+        self.initialize(CROP_MODEL_FILENAME)
         
         basename = os.path.splitext(os.path.basename(input_filepath))[0]
         output_folder = os.path.dirname(output_filepath)
@@ -1220,8 +1321,7 @@ class ForagesROIsDetector():
         if np_image.dtype != np.uint8:
             np_image = cv.normalize(np_image, None, 0, 255, cv.NORM_MINMAX, dtype=cv.CV_8U)
             
-        debug_path = os.path.join(output_folder, basename + "_debug_crop_padded.jpg")
-        img_prec, scale, (h0, w0) = preprocess(np_image, imgsz=imgsz, pad_color=114, debug_path=debug_path)
+        img_prec, scale, (h0, w0) = preprocess(np_image, imgsz=imgsz, pad_color=114)
         
         outputs = self.ort_sess.run(None, {'images':img_prec})
         
@@ -1267,7 +1367,8 @@ class ForagesROIsDetector():
         
         cache_key = {
             "input_raster_path": input_filepath,
-            "tile_size": tile_size
+            "tile_size": tile_size,
+            "tile_overlap": TILE_OVERLAP
         }
         key = cache_manager.compute_key(cache_key)
         
@@ -1280,15 +1381,17 @@ class ForagesROIsDetector():
         if progress_callback: progress_callback({"progress": 2, "status": "Extracting tiles..."})
         if not cache_manager.exists("tiles", key):
             print(f"Extracting tiles from {input_filepath} to cache...")
-            tile_raster_gdal(input_filepath, images_dir, tile_size, prefix="tile_")
+            tile_raster_gdal(input_filepath, images_dir, tile_size, prefix="tile_", overlap=TILE_OVERLAP)
         else:
             print(f"Using cached tiles from {images_dir}")
 
         # Process each tile
         self.batch_processing(images_dir, shp_dir, progress_callback=self.tile_progress(progress_callback), interruption_check=interruption_check)
 
-        # Merge all shapefiles in shp_dir and save
+        # Keep each detection only in the tile that owns its centre, then merge
         shp_files = glob.glob(os.path.join(shp_dir, "*.shp"))
+        shp_files = keep_core_detections(shp_files, images_dir, input_filepath, tile_size, TILE_OVERLAP,
+                                         cache_manager.get_cache_folder_path("core", key))
         print(f"Merging {len(shp_files)} files")
         if progress_callback: progress_callback({"progress": 92, "status": "Merging tiles and numbering plants..."})
 
@@ -1316,6 +1419,7 @@ class ForagesROIsDetector():
                 cache_manager.clean_cache_folder_path("tiles", key)
                 cache_manager.clean_cache_folder_path("shp", key)
                 cache_manager.clean_cache_folder_path("merged", key)
+                cache_manager.clean_cache_folder_path("core", key)
         else:
             print("No shapefiles found to merge in", shp_dir)
 
@@ -1337,7 +1441,7 @@ class ForagesROIsDetector():
         cache_manager = CacheManager(project_path=output_folder)
         
         tile_size = 1024
-        cache_key = {"input_raster_path": input_filepath, "tile_size": tile_size, "crop_mask": crop_shapefile}
+        cache_key = {"input_raster_path": input_filepath, "tile_size": tile_size, "tile_overlap": TILE_OVERLAP, "crop_mask": crop_shapefile}
         key = cache_manager.compute_key(cache_key)
         
         images_dir = cache_manager.get_cache_folder_path("tiles", key)
@@ -1347,13 +1451,16 @@ class ForagesROIsDetector():
         if progress_callback: progress_callback({"progress": 2, "status": "Extracting tiles over crops..."})
         if not cache_manager.exists("tiles", key):
             print(f"Extracting tiles from {input_filepath} over crops to cache...")
-            tile_raster_gdal(input_filepath, images_dir, tile_size, prefix="tile_", crop_shapefile=crop_shapefile)
+            tile_raster_gdal(input_filepath, images_dir, tile_size, prefix="tile_", crop_shapefile=crop_shapefile, overlap=TILE_OVERLAP)
         else:
             print(f"Using cached crop tiles from {images_dir}")
 
         self.batch_processing(images_dir, shp_dir, progress_callback=self.tile_progress(progress_callback), interruption_check=interruption_check)
 
+        # Keep each detection only in the tile that owns its centre, then merge
         shp_files = glob.glob(os.path.join(shp_dir, "*.shp"))
+        shp_files = keep_core_detections(shp_files, images_dir, input_filepath, tile_size, TILE_OVERLAP,
+                                         cache_manager.get_cache_folder_path("core", key))
         print(f"Merging {len(shp_files)} files")
         if progress_callback: progress_callback({"progress": 92, "status": "Merging tiles and numbering plants..."})
 
@@ -1369,6 +1476,7 @@ class ForagesROIsDetector():
                 cache_manager.clean_cache_folder_path("tiles", key)
                 cache_manager.clean_cache_folder_path("shp", key)
                 cache_manager.clean_cache_folder_path("merged", key)
+                cache_manager.clean_cache_folder_path("core", key)
         else:
             print("No shapefiles found to merge in", shp_dir)
 

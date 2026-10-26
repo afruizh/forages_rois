@@ -62,6 +62,7 @@ class ProcessorInterface(QObject):
     visualizationReady = Signal(str) # New signal for QML visualization
     rasterPreviewReady = Signal(str) # New signal for raw raster preview
     visualizationPathsReady = Signal(str, str) # Emits (raster_path, shp_path)
+    modelsStatus = Signal(str, str, str) # Emits (level "ok"/"warning"/"error", models folder, message)
 
     def initialize(self):
         pass
@@ -333,6 +334,54 @@ class ProcessorInterface(QObject):
         except Exception as e:
             print(f"Error loading parameters from {file_path}: {e}")
             self.saveLoadError.emit(f"Error loading parameters: {e}")
+
+    def check_models_folder(self, folder):
+        """Return (level, message) for a models folder: "ok", "warning" (some models missing)
+        or "error" (folder missing or no models at all)."""
+        import custom_processor
+        if not folder or not os.path.isdir(folder):
+            return "error", f"The models folder does not exist:\n{folder}"
+        missing = custom_processor.missing_models(folder)
+        if len(missing) == len(custom_processor.REQUIRED_MODELS):
+            return "error", f"No models were found in:\n{folder}\n\nExpected files:\n" + "\n".join(
+                f"- {name}: {use}" for name, use in custom_processor.REQUIRED_MODELS.items())
+        if missing:
+            return "warning", f"Some models are missing in:\n{folder}\n\nTasks that need them will fail:\n" + "\n".join(
+                f"- {name}: {custom_processor.REQUIRED_MODELS[name]}" for name in missing)
+        return "ok", f"Models folder:\n{folder}\n\nAll models found."
+
+    @Slot(str)
+    def setModelsFolder(self, folder):
+        """Use a new models folder (File > Set Models Folder). It is saved for next sessions
+        unless no models are found in it."""
+        import custom_processor
+        from PySide6.QtCore import QSettings
+        level, message = self.check_models_folder(folder)
+        if level != "error":
+            custom_processor.MODEL_PATH = folder
+            QSettings("CIAT", "ForagesROIs").setValue("models_folder", folder)
+        else:
+            message += f"\n\nThe current models folder is kept:\n{custom_processor.MODEL_PATH}"
+        self.modelsStatus.emit(level, custom_processor.MODEL_PATH, message)
+
+    @Slot()
+    def loadModelsFolder(self):
+        """At startup: use the saved models folder if it still exists, otherwise the default one."""
+        import custom_processor
+        from PySide6.QtCore import QSettings
+        saved = QSettings("CIAT", "ForagesROIs").value("models_folder", "")
+        if saved and os.path.isdir(saved):
+            custom_processor.MODEL_PATH = saved
+        level, message = self.check_models_folder(custom_processor.MODEL_PATH)
+        if level != "ok":
+            message += "\n\nUse File > Set Models Folder to select the folder that contains the models."
+        print(message)
+        self.modelsStatus.emit(level, custom_processor.MODEL_PATH, message)
+
+    @Slot(result=str)
+    def getModelsFolder(self):
+        import custom_processor
+        return custom_processor.MODEL_PATH
 
     @Slot(dict)
     def process(self, params):
