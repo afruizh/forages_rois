@@ -5,7 +5,8 @@
 #
 #   conda env create -f environment_app.yml
 #   conda activate forages_rois_app
-#   pyside6-deploy ForagesROIs.py --init
+#   .\deploy.ps1   (runs this environment's pyside6-rcc, since pip Qt cannot read resources
+#                  compiled by conda's rcc, then pyside6-deploy, then copies the data and DLLs)
 name: forages_rois_app
 channels:
   - conda-forge
@@ -14,8 +15,14 @@ dependencies:
   # Geospatial (GDAL Python bindings, no Qt dependency)
   - gdal=3.13
   - numpy
+  # OpenBLAS instead of MKL for numpy (MKL adds about 540 MB of DLLs to the build)
+  - libblas=*=*openblas
   - pandas
   - shapely
+  # libxml2 build without ICU. With ICU, conda puts its own icuuc.dll in Library\bin, which
+  # shadows the Windows icuuc.dll that pip's Qt6Core uses ("DLL load failed while importing
+  # QtCore: The specified procedure could not be found").
+  - libxml2=2.15.4=h661ae93_1
   # CUDA 12 and cuDNN 9 runtime used by onnxruntime-gpu
   - cuda-version=12.9
   - cuda-cudart

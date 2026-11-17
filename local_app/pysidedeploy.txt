@@ -17,7 +17,7 @@ exec_directory = ForagesROIs
 project_file = 
 
 # application icon
-icon = icon.ico
+icon = res/icon.ico
 
 [python]
 

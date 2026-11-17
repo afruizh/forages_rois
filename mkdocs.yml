@@ -1,0 +1,57 @@
+# Documentation site of ForagesROIs (MkDocs with the Material theme), pages in docs/.
+# View locally:  uvx --with mkdocs-material mkdocs serve
+# Published to GitHub Pages by .github/workflows/docs.yml on every push to main.
+site_name: ForagesROIs
+site_description: Detection, numbering and traits of individual forage plants in UAV orthomosaics
+site_url: https://afruizh.github.io/forages_rois/
+repo_url: https://github.com/afruizh/forages_rois
+repo_name: afruizh/forages_rois
+copyright: Tropical Forages Program | Alliance Bioversity International & CIAT. Code under the Apache License 2.0. Models under AGPL-3.0.
+docs_dir: docs
+
+theme:
+  name: material
+  logo: images/icon.png        # application icon (local_app/res/icon.png)
+  favicon: images/icon.png
+  features:
+    - navigation.sections
+    - navigation.top
+    - search.highlight
+    - content.code.copy
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: custom    # dark green of the splash screen, docs/stylesheets/extra.css
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: custom
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+
+extra_css:
+  - stylesheets/extra.css
+
+nav:
+  - Home: index.md
+  - Desktop application (GUI): gui.md
+  - Command line (CLI): cli.md
+  - Outputs: outputs.md
+  - Models: models.md
+  - Scripts and AI agents: agents.md
+
+markdown_extensions:
+  - tables
+  - toc:
+      permalink: true
+  - admonition
+  - pymdownx.highlight
+  - pymdownx.superfences
+
+validation:
+  links:
+    not_found: warn
+    anchors: warn

@@ -1,0 +1,8 @@
+/* Header and accents in the dark green of the application splash screen (local_app/splash.png) */
+:root,
+[data-md-color-scheme="slate"] {
+  --md-primary-fg-color: #12352a;        /* header and navigation tabs */
+  --md-primary-fg-color--light: #1d4d3c;
+  --md-primary-fg-color--dark: #0b241c;
+  --md-accent-fg-color: #3fae5a;         /* links on hover, like the grass of the icon */
+}

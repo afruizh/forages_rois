@@ -33,6 +33,7 @@ class Worker(QThread):
             results = {"status": "error", "message": str(e)}
             self.progressUpdated.emit({"status": "Error occurred.", "progress": 0})
 
+        self.results = results  # read by the CLI after wait() (no event loop there)
         if not self.isInterruptionRequested():
             print("Processing finished!")
             #self.finished.emit({})
@@ -53,6 +54,25 @@ class Worker(QThread):
     def requestInterruption(self):
         self._is_interruption_requested = True
 
+class ModelsDownloadWorker(QThread):
+    """Downloads the missing models in the background (see custom_processor.download_models)."""
+    finished = Signal(dict)
+    progressUpdated = Signal(dict)
+
+    def __init__(self, folder):
+        super().__init__()
+        self.folder = folder
+
+    def run(self):
+        import custom_processor
+        try:
+            names = custom_processor.download_models(self.folder, progress_callback=self.progressUpdated.emit,
+                                                     interruption_check=self.isInterruptionRequested)
+            results = {"status": "completed", "downloaded": names}
+        except Exception as e:
+            results = {"status": "error", "message": str(e)}
+        self.finished.emit(results)
+
 class ProcessorInterface(QObject):
     """Interface for processing tasks."""
 
@@ -60,8 +80,10 @@ class ProcessorInterface(QObject):
     finished = Signal(dict)
     progressUpdated = Signal(dict) # Relay progress signal
     visualizationReady = Signal(str) # New signal for QML visualization
-    rasterPreviewReady = Signal(str) # New signal for raw raster preview
+    rasterPreviewReady = Signal(str, str) # (preview image, raster shown: the RGB view of the chosen bands)
+    rasterBandsInfo = Signal("QVariantList", "QVariantList", bool) # (band labels, [r, g, b] used, user should choose)
     visualizationPathsReady = Signal(str, str) # Emits (raster_path, shp_path)
+    outlinesReady = Signal(str)  # plant outlines layer (plant_traits output) for the preview
     modelsStatus = Signal(str, str, str) # Emits (level "ok"/"warning"/"error", models folder, message)
 
     def initialize(self):
@@ -100,19 +122,45 @@ class ProcessorInterface(QObject):
         # Clean up worker reference
         self.worker = None
 
-    @Slot(str)
-    def previewRaster(self, input_raster):
-        """Generates a quick thumbnail preview of the input raster without any shapefiles."""
+    def previewImagePath(self, name, folder):
+        """Path for a preview image in the cache of folder (the output folder), or in the default
+        cache before one is chosen or if folder cannot be written (see cachemanager)."""
+        from utils.cachemanager import cache_folder
+        for base in (cache_folder(folder), cache_folder(None)):
+            path = os.path.join(base, name)
+            try:
+                os.makedirs(base, exist_ok=True)
+                return path
+            except OSError:
+                continue
+        return path
+
+    def rgbView(self, input_raster, folder, bands=""):
+        """RGB view of the raster with the chosen bands (see rgb_bands); the raster itself when it
+        is already 8 bit RGB. The view goes to the same cache as the previews."""
+        from processing.rgb_bands import rgb_raster, parse_bands
+        cache = os.path.dirname(self.previewImagePath("x", folder))
+        return rgb_raster(input_raster, parse_bands(bands), cache)
+
+    @Slot(str, str)
+    @Slot(str, str, str)
+    def previewRaster(self, input_raster, output_folder="", bands=""):
+        """Generates a quick thumbnail preview of the input raster without any shapefiles.
+        bands: "r,g,b" chosen in the GUI, or empty to guess them."""
         import traceback
         try:
             if not input_raster or not os.path.exists(input_raster):
                 return
-            
+
             import cv2
             import numpy as np
             from osgeo import gdal
-            
-            ds = gdal.Open(input_raster)
+            from processing.rgb_bands import band_labels, guess_rgb_bands, parse_bands, choose_bands
+
+            used = parse_bands(bands) or guess_rgb_bands(input_raster)
+            self.rasterBandsInfo.emit(band_labels(input_raster), used, choose_bands(input_raster))
+            shown_raster = self.rgbView(input_raster, output_folder, ",".join(map(str, used)))
+            ds = gdal.Open(shown_raster)
             if not ds:
                 return
                 
@@ -140,13 +188,12 @@ class ProcessorInterface(QObject):
             else:
                 img = np.ascontiguousarray(img)
                 
-            vis_path = os.path.join(os.path.expanduser("~"), ".cache_forages_rois", "preview_raster.png")
-            os.makedirs(os.path.dirname(vis_path), exist_ok=True)
+            vis_path = self.previewImagePath("preview_raster.png", output_folder)
             
             img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
             cv2.imwrite(vis_path, img_bgr)
             
-            self.rasterPreviewReady.emit(vis_path)
+            self.rasterPreviewReady.emit(vis_path, shown_raster)
             print(f"Raster preview saved to {vis_path}")
         except Exception as e:
             print(f"Raster preview error: {e}")
@@ -167,7 +214,9 @@ class ProcessorInterface(QObject):
             basename = os.path.splitext(os.path.basename(input_raster))[0]
             
             task = self.last_params.get("task", "")
-            
+            if task == "export_coco":
+                return  # writes a dataset folder, not a layer: the preview keeps what it shows
+
             # Prefer the output path reported by the processor; fall back to the naming convention
             output_shp = (getattr(self, "last_results", None) or {}).get("output_file")
             if output_shp and os.path.exists(output_shp):
@@ -182,7 +231,7 @@ class ProcessorInterface(QObject):
                 elif task == "tiling_detection_on_crop":
                     output_shp = os.path.join(output_folder, f"{basename}_on_crop.shp")
                 elif task == "plot_numbering":
-                    output_shp = os.path.join(output_folder, f"{basename}_numbering.shp")
+                    output_shp = self.last_params.get("input_shapefile") or input_raster  # numbered in place
                 elif task == "postprocessing":
                     output_shp = os.path.join(output_folder, f"{basename}_postprocess.shp")
                 else:
@@ -198,7 +247,9 @@ class ProcessorInterface(QObject):
             import cv2
             import numpy as np
             from osgeo import gdal, ogr
-            
+
+            # Same RGB view (chosen bands) as the processing and the raster preview
+            input_raster = self.rgbView(input_raster, output_folder, self.last_params.get("bands", ""))
             ds = gdal.Open(input_raster)
             if not ds:
                 return
@@ -252,14 +303,20 @@ class ProcessorInterface(QObject):
                                 pts = pts.reshape((-1, 1, 2))
                                 cv2.polylines(img, [pts], isClosed=True, color=(0, 255, 0), thickness=2)
                 
-            vis_path = os.path.join(os.path.expanduser("~"), ".cache_forages_rois", "vis.png")
-            os.makedirs(os.path.dirname(vis_path), exist_ok=True)
+            vis_path = self.previewImagePath("vis.png", output_folder)
             
             img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
             cv2.imwrite(vis_path, img_bgr)
             
             self.visualizationReady.emit(vis_path)
-            self.visualizationPathsReady.emit(input_raster, output_shp)
+            # plant_traits: keep the input boxes as the detections layer and add the outlines as a
+            # second layer, so both can be shown; other tasks replace the detections layer
+            boxes = self.last_params.get("input_shapefile") if task == "plant_traits" else ""
+            if boxes and os.path.exists(boxes):
+                self.visualizationPathsReady.emit(input_raster, boxes)
+                self.outlinesReady.emit(output_shp)
+            else:
+                self.visualizationPathsReady.emit(input_raster, output_shp)
             print(f"Visualization saved to {vis_path}")
             
         except Exception as e:
@@ -284,7 +341,10 @@ class ProcessorInterface(QObject):
 
     @Slot(str)
     def openOutputFolder(self, output_folder):
-        """Open the output folder in the default file explorer."""
+        """Open the output folder in the default file explorer (for a file path, its parent folder)."""
+        output_folder = output_folder.replace("file:///", "")
+        if not os.path.isdir(output_folder):
+            output_folder = os.path.dirname(output_folder)
         if os.path.isdir(output_folder): # Check if it's a valid directory
             try:
                 import subprocess
@@ -355,11 +415,11 @@ class ProcessorInterface(QObject):
         """Use a new models folder (File > Set Models Folder). It is saved for next sessions
         unless no models are found in it."""
         import custom_processor
-        from PySide6.QtCore import QSettings
+        from utils.app_settings import settings
         level, message = self.check_models_folder(folder)
         if level != "error":
             custom_processor.MODEL_PATH = folder
-            QSettings("CIAT", "ForagesROIs").setValue("models_folder", folder)
+            settings().setValue("models_folder", folder)
         else:
             message += f"\n\nThe current models folder is kept:\n{custom_processor.MODEL_PATH}"
         self.modelsStatus.emit(level, custom_processor.MODEL_PATH, message)
@@ -368,15 +428,106 @@ class ProcessorInterface(QObject):
     def loadModelsFolder(self):
         """At startup: use the saved models folder if it still exists, otherwise the default one."""
         import custom_processor
-        from PySide6.QtCore import QSettings
-        saved = QSettings("CIAT", "ForagesROIs").value("models_folder", "")
+        from utils.app_settings import settings
+        saved = settings().value("models_folder", "")
         if saved and os.path.isdir(saved):
             custom_processor.MODEL_PATH = saved
         level, message = self.check_models_folder(custom_processor.MODEL_PATH)
         if level != "ok":
-            message += "\n\nUse File > Set Models Folder to select the folder that contains the models."
+            message += ("\n\nUse File > Download Models to download them from Hugging Face (about 100 MB), "
+                        "or File > Set Models Folder to select the folder that contains them.")
         print(message)
         self.modelsStatus.emit(level, custom_processor.MODEL_PATH, message)
+
+    def writable_models_folder(self, folder):
+        """folder if models can be written there, otherwise a models folder in the user's
+        application data (for an executable unzipped where the user cannot write)."""
+        try:
+            os.makedirs(folder, exist_ok=True)
+            test = os.path.join(folder, ".write_test")
+            open(test, "w").close()
+            os.remove(test)
+            return folder
+        except OSError:
+            from PySide6.QtCore import QStandardPaths
+            return os.path.join(QStandardPaths.writableLocation(QStandardPaths.AppLocalDataLocation), "models")
+
+    @Slot()
+    def downloadModels(self):
+        """Download the missing models into the models folder (File > Download Models). When it ends,
+        the folder is checked and saved like with Set Models Folder; errors go to the error dialog."""
+        import custom_processor
+        if getattr(self, "worker", None) is not None and self.worker.isRunning():
+            self.finished.emit({"status": "error", "message": "Wait until the current task ends before downloading the models."})
+            return
+        self.worker = ModelsDownloadWorker(self.writable_models_folder(custom_processor.MODEL_PATH))
+        self.worker.progressUpdated.connect(self.progressUpdated)
+        self.worker.finished.connect(self.onModelsDownloaded)
+        self.worker.start()
+
+    @Slot(dict)
+    def onModelsDownloaded(self, info):
+        folder = self.worker.folder
+        self.worker = None
+        if info.get("status") == "error":
+            self.finished.emit(info)
+            return
+        self.progressUpdated.emit({"progress": 100, "status": "Models downloaded." if info.get("downloaded") else "All models found."})
+        self.setModelsFolder(folder)
+
+    # ---- Cache (File > Cache): default cache folder and the cache of the output folder ----
+
+    @Slot(str, result=str)
+    def cacheFolder(self, output_folder):
+        """The cache of output_folder, or the default cache for an empty string."""
+        from utils.cachemanager import cache_folder
+        return cache_folder(output_folder)
+
+    @Slot(str, result=str)
+    def cacheSizeText(self, folder):
+        from utils.cachemanager import folder_size
+        size = folder_size(folder)
+        return f"{size / 2**30:.1f} GB" if size >= 2**30 else f"{size / 2**20:.0f} MB"
+
+    @Slot(str)
+    def openCacheFolder(self, folder):
+        os.makedirs(folder, exist_ok=True)
+        self.openOutputFolder(folder)
+
+    # ---- Last folder used in the file dialogs (see app_settings) ----
+
+    @Slot(str, str, str, result=str)
+    def startFolderUrl(self, kind, current_path, preferred_folder):
+        """URL of the folder a dialog of this kind should open in (works for network paths too)."""
+        from PySide6.QtCore import QUrl
+        from utils.app_settings import start_folder
+        return QUrl.fromLocalFile(start_folder(kind, current_path, preferred_folder)).toString()
+
+    @Slot(str, str)
+    def rememberFolder(self, kind, path):
+        from utils.app_settings import remember_folder
+        remember_folder(kind, path)
+
+    @Slot(str)
+    def setDefaultCacheFolder(self, folder):
+        """Default cache in folder/.cache_forages_rois from now on (saved for next sessions)."""
+        from utils.app_settings import settings
+        from utils.cachemanager import default_cache_folder
+        settings().setValue("cache_folder", folder)
+        self.progressUpdated.emit({"status": f" Default cache: {default_cache_folder()}"})
+
+    @Slot(str)
+    def clearCache(self, folder):
+        """Delete a cache folder (only ForagesROIs cache folders, see cachemanager.clear_cache)."""
+        from utils.cachemanager import clear_cache
+        if getattr(self, "worker", None) is not None and self.worker.isRunning():
+            self.finished.emit({"status": "error", "message": "Wait until the current task ends before clearing the cache."})
+            return
+        try:
+            clear_cache(folder)
+            self.progressUpdated.emit({"progress": 0, "status": f" Cache cleared: {folder}"})
+        except Exception as e:
+            self.finished.emit({"status": "error", "message": f"Could not clear the cache:\n{folder}\n\n{e}"})
 
     @Slot(result=str)
     def getModelsFolder(self):

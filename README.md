@@ -7,6 +7,10 @@
 
 **An intelligent computer vision system for automatic of forage grasses in high-resolution UAV imagery using deep learning and GIS integration.**
 
+**Documentation:** user guide for the desktop application and the command line at https://afruizh.github.io/forages_rois/ (source in [`docs`](docs)).
+
+The documentation is built with MkDocs (`mkdocs.yml`). To view it locally, from this folder: `uvx --with mkdocs-material mkdocs serve`, then open http://127.0.0.1:8000.
+
 ---
 
 ## Features
@@ -51,6 +55,34 @@ forages_rois/
 │   └── models/               # AI models (ONNX format)
 ├── plugins/               # QGIS plugin integration
 │   ├── foragesrois    # QGIS plugin
+```
+
+Detail of `local_app` (v1.0):
+
+```
+local_app/
+├── ForagesROIs.py            # entry point: GUI, or a task with --cli (--json summary)
+├── custom_processor.py       # pipeline: tiling, inference, merging, numbering, plant traits
+├── view.qml                  # main window (QML)
+├── resources.qrc             # Qt resources (view.qml and res/), compiled to rc_resources.py
+├── res/                      # images: icon.png, icon.ico, splash.png, tf.png (program logo)
+├── interface/                # Qt side
+│   ├── interface.py          #   bridge between the QML window and the processing
+│   ├── processor.py          #   runs each task in a background thread
+│   ├── raster_preview_item.py#   preview: raster, detection boxes and plant outlines
+│   ├── detection_editor.py   #   erase and add boxes, with undo
+│   └── batchprocessor.py     #   inference over the tiles
+├── processing/               # processing steps without Qt
+│   ├── rgb_bands.py          #   RGB view of multiband rasters, resampling (GDAL VRT)
+│   ├── spectral_indices.py   #   RGBVI, ExG, NDVI, NDRE, GNDVI for plant traits
+│   ├── coco_export.py        #   COCO dataset of RGB tiles from reviewed boxes
+│   └── yolo_seg_util.py      #   decoding of the crop field model output
+├── utils/                    # shared helpers
+│   ├── cachemanager.py       #   cache folders
+│   ├── app_settings.py       #   QSettings (models and cache folders, last folders)
+│   └── result_summary.py     #   JSON summary of a result
+├── models/                   # ONNX models (downloaded from Hugging Face)
+└── deploy.ps1, pysidedeploy.spec, environment_app.yml   # build
 ```
 
 ---
@@ -109,7 +141,60 @@ modules = Core,Gui,Network,Widgets,OpenGL
 mode = release
 arch = "x86_64"
 extra_args = --quiet --noinclude-qt-translations
-``` -->
+```
+
+### Building with deploy.ps1 (forages_rois_app environment)
+Standalone folder (exe plus DLLs and data) built with `pyside6-deploy` (Nuitka). Use the `forages_rois_app` environment (pip PySide6, which includes `pyside6-deploy`), not `forages_rois`.
+
+```bash
+cd local_app
+
+# Once: create the build environment
+conda env create -f environment_app.yml
+
+# Each build (PowerShell)
+conda activate forages_rois_app
+.\deploy.ps1
+```
+
+`deploy.ps1` compiles `resources.qrc` with this environment's `pyside6-rcc` (pip Qt cannot read resources compiled by conda's rcc), runs `pyside6-deploy -c pysidedeploy.spec -f` and copies the files Nuitka does not bundle. Result: `local_app\dist\ForagesROIs.dist`; zip that folder to distribute it. If Windows blocks scripts, run `powershell -ExecutionPolicy Bypass -File .\deploy.ps1`.
+
+### Configuration Options for deploy.ps1
+```ini
+# pysidedeploy.spec (main settings)
+title = ForagesROIs
+icon = icon.ico
+exec_directory = dist          # pyside6-deploy copies every other folder in local_app into the build
+python_path = <forages_rois_app>\python.exe
+qml_files = view.qml
+mode = standalone              # not onefile: the CUDA DLLs (over 1 GB) would be unpacked at every start
+extra_args = --quiet --noinclude-qt-translations --windows-console-mode=attach
+```
+
+`--windows-console-mode=attach`: no terminal window on double click; `--cli` output still goes to the terminal it is run from.
+
+### Extra files required next to ForagesROIs.exe
+Copied by `deploy.ps1` from the environment (`%CONDA_PREFIX%\Library`):
+- `models\`: `forages_rois_yolo_full_1024.onnx` and `crop_detection.onnx`.
+- `proj_dir\share\proj\`: PROJ data from `Library\share\proj` (must match the PROJ version of the build). Without it: `Cannot find proj.db`.
+- `gdal_data\`: GDAL data from `Library\share\gdal`.
+- DLLs from `Library\bin` loaded at run time, which Nuitka does not detect:
+  - CUDA: `cudart64_12.dll`, `cublas64_12.dll`, `cublasLt64_12.dll`, `cufft64_11.dll`
+  - cuDNN: all `cudnn*64_9.dll` (without them the exe crashes at the first tile)
+  - NVRTC: `nvrtc64_120_0.dll`, `nvrtc64_120_0.alt.dll`, `nvrtc-builtins64_129.dll`
+  - OpenBLAS: `openblas.dll` (numpy's BLAS; the environment uses OpenBLAS instead of MKL, which added about 540 MB and needed the OpenMP DLLs `libiomp5md.dll` and `libomp.dll`)
+
+### Testing the build
+In a terminal with no conda environment active, open the GUI and run one detection, for example `ForagesROIs.exe --cli --task tiling_detection --input sample.tif --output out\detections.shp`. Target PCs need an NVIDIA driver that supports CUDA 12.9.
+
+Because of `--windows-console-mode=attach` the exe is a GUI program, so PowerShell does not wait for it: the prompt comes back at once while the run continues and prints to the same terminal. To wait until it finishes (in scripts, or to time a run), use one of:
+- `Start-Process .\ForagesROIs.exe -ArgumentList "--cli --task tiling_detection --input sample.tif --output out" -Wait -NoNewWindow`
+- `cmd /c ForagesROIs.exe --cli --task tiling_detection --input sample.tif --output out`
+
+Output files are complete only when the process has ended. -->
+
+### Command line use of ForagesROIs.exe
+`ForagesROIs.exe --cli --task <task> --input <raster or shapefile> --output <folder or .shp>` runs a task without the GUI (`ForagesROIs.exe --help` lists all options). In PowerShell the prompt returns before the run ends; add `Start-Process ... -Wait -NoNewWindow` or run it through `cmd /c ForagesROIs.exe ...` to wait for it.
 
 ```
 conda env create -f environment.yml
@@ -129,6 +214,8 @@ conda activate forages_rois
 ## License
 
 This project is licensed under the **Apache License 2.0** - see the [LICENSE](LICENSE) file for details.
+
+**Note:** the trained models (`.onnx` files in `models`) are not covered by the Apache License. They were trained with Ultralytics YOLO and are distributed separately under the **AGPL-3.0** license at https://huggingface.co/anfruizhu/forages-rois-models.
 
 ## Acknowledgment
 

@@ -186,3 +186,6 @@ _temp_raster.tif
 
 # Qt Resource Compilations
 rc_resources.py
+
+# MkDocs build output
+site/
