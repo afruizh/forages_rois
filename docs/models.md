@@ -4,7 +4,7 @@ title: Models
 
 # Models
 
-ForagesROIs uses two ONNX models, loaded by file name from the models folder (by default `models` next to the executable; change it with **File > Set Models Folder...**). They are included in the release. If they are missing, **File > Download Models** (or `ForagesROIs.exe --download_models`) downloads version v1.0.0 from Hugging Face and checks each file against its SHA256 checksum before using it.
+ForagesROIs uses two ONNX models, loaded by file name from the models folder (by default `models` next to the executable; change it in **File > Preferences**, where each model can also be replaced by another file). They are included in the release. If they are missing, **File > Download Models** (or `ForagesROIs.exe --download_models`) downloads version v1.0.0 from Hugging Face and checks each file against its SHA256 checksum before using it.
 
 | File | Task | Model | Input | Classes |
 | :--- | :--- | :--- | :--- | :--- |
@@ -23,4 +23,4 @@ The plant model was trained on orthomosaics of 1.1 to 1.7 cm per pixel. For plan
 
 ## Using other models
 
-A new model must keep the file name and the output format of the one it replaces (YOLO detect exported to ONNX without NMS for plants, YOLO segment with NMS for crop fields). Put it in a separate folder and select that folder with **File > Set Models Folder...** to compare it with the current one.
+To try another model, choose its file in **File > Preferences > Models** (or `--plant_model` and `--crop_model` on the command line); the file can have any name. It must keep the input and output of the model it replaces: input `images` of 1024 px for plants and 640 px for crop fields, and for plants a YOLO detect output (YOLOv8 or YOLO11 without NMS, or YOLO26 with its final boxes), for crop fields a YOLO segment output with NMS. The classes must be in the same order (plants: 0 urochloa, 1 megathyrsus). The detection cache depends on the model file, so a new model always runs again, and the JSON summary of each run gives the `model` file and the `device` used.

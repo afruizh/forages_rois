@@ -69,6 +69,10 @@ def summarize(results):
         "output_file": output,
         "skipped": bool(results.get("skipped", False)),
     }
+    # Model file and device used (detection tasks), to tell which model made a result
+    for key in ("model", "device"):
+        if results.get(key):
+            summary[key] = results[key]
     if output and output.lower().endswith(".json") and os.path.exists(output):
         summary["counts"] = _coco_counts(output)  # export_coco
     if output and output.lower().endswith(".shp") and os.path.exists(output):

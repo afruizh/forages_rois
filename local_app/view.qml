@@ -5,6 +5,7 @@ import QtQuick.Dialogs
 import Qt5Compat.GraphicalEffects
 import QtQuick.Effects
 import CustomComponents 1.0
+import "interface"
 
 ApplicationWindow {
     id: mainWindow
@@ -70,6 +71,18 @@ ApplicationWindow {
         progressBar.value = 0;
         statusLabel.text = "Ready";
     }
+    // Run the task of lastParams (set by Run Inference). overwrite: delete an existing output and run
+    // again (the answer to overwriteDialog, or Preferences > When the output already exists: Overwrite)
+    property var lastParams: ({})
+    property string lastTask: lastParams.task || ""
+    function runTask(overwrite) {
+        var params = Object.assign({}, lastParams);
+        params.overwrite = overwrite || preferences.whenOutputExists() === "overwrite";
+        taskRunning = true;
+        progressBar.value = 0;
+        statusLabel.text = "Processing started...";
+        processorInterface.process(params);
+    }
     function refreshBands() {
         statusLabel.text = "Updating the preview with bands " + bandsText() + "...";
         processorInterface.previewRaster(inputRasterPath, outputFolderPath, bandsText());
@@ -105,13 +118,6 @@ ApplicationWindow {
             }
             MenuSeparator {}
             Action {
-                text: qsTr("Set &Models Folder...")
-                onTriggered: {
-                    modelsFolderDialog.currentFolder = "file:///" + processorInterface.getModelsFolder();
-                    modelsFolderDialog.open();
-                }
-            }
-            Action {
                 text: qsTr("&Download Models")
                 onTriggered: {
                     modelsFromMenu = true;
@@ -141,10 +147,6 @@ ApplicationWindow {
                     enabled: cacheMenu.outputFolder !== ""
                     onTriggered: processorInterface.openCacheFolder(cacheMenu.outputFolder)
                 }
-                Action {
-                    text: qsTr("Set Default Cache Folder...")
-                    onTriggered: openInFolder(cacheFolderDialog, "cache", "", "")
-                }
                 MenuSeparator {}
                 Action {
                     text: qsTr("Clear Default Cache (%1)").arg(cacheMenu.defaultSize)
@@ -163,6 +165,13 @@ ApplicationWindow {
                         clearCacheDialog.open();
                     }
                 }
+            }
+            MenuSeparator {}
+            // Models, processing device, existing outputs and cache folder (interface/PreferencesDialog.qml)
+            Action {
+                text: qsTr("&Preferences...")
+                shortcut: "Ctrl+,"
+                onTriggered: preferencesDialog.openDialog()
             }
             MenuSeparator {}
             Action {
@@ -297,21 +306,61 @@ ApplicationWindow {
         }
     }
 
-    FolderDialog {
-        id: modelsFolderDialog
-        title: qsTr("Please choose the folder that contains the models (.onnx)")
-        onAccepted: {
-            modelsFromMenu = true;
-            processorInterface.setModelsFolder(urlToLocalPath(modelsFolderDialog.selectedFolder.toString()));
-        }
+    PreferencesDialog {
+        id: preferencesDialog
     }
 
-    FolderDialog {
-        id: cacheFolderDialog
-        title: qsTr("Choose a folder for the default cache (a .cache_forages_rois folder is made inside)")
-        onAccepted: {
-            processorInterface.setDefaultCacheFolder(urlToLocalPath(cacheFolderDialog.selectedFolder.toString()));
-            processorInterface.rememberFolder("cache", urlToLocalPath(cacheFolderDialog.selectedFolder.toString()));
+    // The output of the task already exists (Preferences > When the output already exists: Ask)
+    Dialog {
+        id: overwriteDialog
+        title: qsTr("Output Already Exists")
+        parent: Overlay.overlay
+        anchors.centerIn: parent
+        width: Math.min(560, mainWindow.width - 40)
+        modal: true
+        property string outputFile: ""
+        ColumnLayout {
+            anchors.fill: parent
+            spacing: 10
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.WrapAnywhere
+                text: qsTr("This output already exists:
+%1").arg(overwriteDialog.outputFile)
+            }
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.Wrap
+                text: qsTr("Overwrite it and run the task again? Edits saved in it will be lost. Keep it to use the existing output as it is.")
+            }
+            CheckBox {
+                id: dontAskAgain
+                text: qsTr("Don't ask again (change it in File > Preferences)")
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                Item { Layout.fillWidth: true }
+                Button {
+                    text: qsTr("Overwrite")
+                    highlighted: true
+                    onClicked: {
+                        if (dontAskAgain.checked)
+                            preferences.setWhenOutputExists("overwrite");
+                        overwriteDialog.close();
+                        runTask(true);
+                    }
+                }
+                Button {
+                    text: qsTr("Keep It")
+                    onClicked: {
+                        if (dontAskAgain.checked)
+                            preferences.setWhenOutputExists("skip");
+                        overwriteDialog.close();
+                        statusLabel.text = "Existing output kept";
+                        suggestNextInputs(lastTask, overwriteDialog.outputFile);
+                    }
+                }
+            }
         }
     }
 
@@ -401,6 +450,12 @@ ApplicationWindow {
                 statusLabel.text = "Error";
                 errorDialog.text = info.message || "An unknown error occurred.";
                 errorDialog.open();
+            } else if (info.skipped && preferences.whenOutputExists() === "ask") {
+                // The output already exists: ask whether to overwrite it and run again
+                statusLabel.text = "Output already exists";
+                overwriteDialog.outputFile = info.output_file || "";
+                dontAskAgain.checked = false;
+                overwriteDialog.open();
             } else {
                 // Show what actually happened (output path, or skipped because it already exists)
                 statusLabel.text = "Finished";
@@ -699,6 +754,22 @@ ApplicationWindow {
                                                 id: taskCombo
                                                 Layout.fillWidth: true
                                                 model: ["tiling_detection", "crop_detection", "tiling_detection_on_crop", "tiling_detection_only", "plot_numbering", "postprocessing", "plant_traits", "export_coco"]
+                                            }
+                                            // Models and device in use; click to change them in File > Preferences
+                                            Label {
+                                                Layout.fillWidth: true
+                                                wrapMode: Text.Wrap
+                                                font.pointSize: 8
+                                                color: "#555555"
+                                                text: preferences.summary.split("   |   ").join("\n")
+                                                MouseArea {
+                                                    anchors.fill: parent
+                                                    cursorShape: Qt.PointingHandCursor
+                                                    onClicked: preferencesDialog.openDialog()
+                                                }
+                                                ToolTip.visible: summaryHover.hovered
+                                                ToolTip.text: qsTr("Change in File > Preferences")
+                                                HoverHandler { id: summaryHover }
                                             }
                                         }
 
@@ -1065,10 +1136,7 @@ ApplicationWindow {
                                                     // plot_numbering rewrites the shown shapefile: save pending edits into it first
                                                     if (taskCombo.currentText === "plot_numbering" && rasterItem.hasEdits)
                                                         rasterItem.saveEdits();
-                                                    taskRunning = true;
-                                                    progressBar.value = 0;
-                                                    statusLabel.text = "Processing started...";
-                                                    var params = {
+                                                    lastParams = {
                                                         "task": taskCombo.currentText,
                                                         "input_file": inputRasterPath,
                                                         "output_folder": outputFolderPath,
@@ -1085,7 +1153,7 @@ ApplicationWindow {
                                                         "bands": bandsText(),
                                                         "resample": resampleCheckbox.checked
                                                     };
-                                                    processorInterface.process(params);
+                                                    runTask(false);
                                                 }
                                             }
                                             Button {

@@ -26,13 +26,17 @@ ForagesROIs.exe --cli --task <task> --input <file> --output <folder or .shp> [op
 | `--start_corner` | `plot_numbering` | `NW` (default), `NE`, `SW` or `SE`. |
 | `--swap_axes` | `plot_numbering` | Number along the other axis of the trial. |
 | `--raster` | `plant_traits`, `export_coco` | The orthomosaic (the shapefile is `--input`). |
-| `--crop_shapefile` | `tiling_detection_on_crop`, `export_coco` | Crop fields (default: `<raster>_crops.shp` in the output folder). |
+| `--crop_shapefile` | `tiling_detection_on_crop`, `export_coco`, `plot_numbering` | Crop fields (default: `<raster>_crops.shp` in the output folder). For `plot_numbering` of a `<raster>_on_crop.shp`, the default is `<raster>_crops.shp` next to it: empty plots at the row ends are then added only inside each field, as in the first run. Without it, row ends get empty plots only where there are at most two. |
 | `--index` | `plant_traits` | `RGBVI`, `ExG`, `NDVI`, `NDRE` or `GNDVI`. Default: `NDVI` when the raster has a near infrared band, otherwise `RGBVI`. |
 | `--nir_band` | `plant_traits` | Number of the near infrared band (default: found from the band names, such as NIR or 840 nm). |
 | `--rededge_band` | `plant_traits` | Number of the red edge band (default: found from the band names, such as RedEdge or 730 nm). |
 | `--threshold` | `plant_traits` | Fixed index threshold (default: automatic, Otsu's method per field). |
 | `--bands` | tasks that read the raster | Bands used as red, green and blue, for example `3,2,1` for a multispectral orthomosaic ordered blue, green, red. Default: guessed from the band colours and names, otherwise `1,2,3`. |
 | `--no_resample` | detection tasks | Do not resample rasters finer than the model resolution (by default, below 1.1 cm per pixel they are resampled to 1.5 cm). |
+| `--plant_model` | detection tasks | Plant detection model (`.onnx`) for this run, instead of the one chosen in **File > Preferences** or the default `forages_rois_yolo_full_1024.onnx`. |
+| `--crop_model` | `crop_detection` | Crop field model (`.onnx`) for this run, instead of the one in Preferences or the default `crop_detection.onnx`. |
+| `--cpu` | detection tasks | Run the models on the CPU only. Default: the GPU when available, otherwise the CPU. |
+| `--overwrite` | all | When the output already exists, delete it and run the task again. Without it the task is skipped and reports `skipped`, so scripts never delete results unless asked. |
 | `--clear_cache` | | `default` deletes the default cache; `output` deletes the cache of the `--output` folder (results are kept). Alone it only clears; with `--cli` it clears before the task. |
 | `--json` | all | Print a JSON summary as the last line (status, output file, counts); see [Scripts and AI agents](agents.md). The exit code is 0 on success and 1 on error, with or without `--json`. |
 | `--download_models` | | Download the missing models from Hugging Face into the models folder. Alone it only downloads; with `--cli` it downloads before running the task. |

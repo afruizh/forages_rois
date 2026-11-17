@@ -103,7 +103,10 @@ def run_gui(input_path=None, output_folder=None):
 
     from interface.interface import ProcessorInterface
     from interface.raster_preview_item import RasterPreviewItem
+    from interface.preferences import Preferences, apply_saved_preferences
     processorInterface = ProcessorInterface()
+    apply_saved_preferences()  # before the window reads the models summary
+    preferences = Preferences()
 
     if splash:
         splash.showMessage("Loading interface...")
@@ -112,6 +115,7 @@ def run_gui(input_path=None, output_folder=None):
     engine = QQmlApplicationEngine()
     engine.quit.connect(app.quit)
     engine.rootContext().setContextProperty("processorInterface", processorInterface)
+    engine.rootContext().setContextProperty("preferences", preferences)  # File > Preferences
 
     if USE_RESOURCES:
         engine.load(QUrl("qrc:/view.qml"))
@@ -152,7 +156,18 @@ def run_cli(args):
 
     from interface.interface import ProcessorInterface
     processorInterface = ProcessorInterface()
-    processorInterface.loadModelsFolder()  # same models folder as the GUI (saved setting or default)
+    processorInterface.loadModelsFolder()  # same models folder, models and device as the GUI (Preferences)
+
+    # Models and device for this run only (the saved preferences are not changed)
+    import custom_processor
+    for option, name in ((args.plant_model, custom_processor.MODEL_FILENAME), (args.crop_model, custom_processor.CROP_MODEL_FILENAME)):
+        if option:
+            if not os.path.isfile(option):
+                print(f"Error: model file not found: {option}")
+                sys.exit(1)
+            custom_processor.CUSTOM_MODELS[name] = os.path.abspath(option)
+    if args.cpu:
+        custom_processor.USE_GPU = False
 
     if args.download_models:
         import custom_processor
@@ -278,7 +293,7 @@ if __name__ == "__main__":
     parser.add_argument("--swap_axes", action="store_true", help="Number along the other grid axis when rows are detected as columns.")
     parser.add_argument("--empty_plots", action="store_true", help="For tiling_detection, tiling_detection_on_crop and plot_numbering: number planting positions, so that a missing plant gets an empty plot with its own number (default: only the detected plants are numbered).")
     parser.add_argument("--raster", type=str, help="Orthomosaic for --task plant_traits and export_coco (the ROIs shapefile is --input).")
-    parser.add_argument("--crop_shapefile", type=str, help="Crop fields for tiling_detection_on_crop and export_coco (default: <raster>_crops.shp in the output folder).")
+    parser.add_argument("--crop_shapefile", type=str, help="Crop fields for tiling_detection_on_crop and export_coco (default: <raster>_crops.shp in the output folder), and for plot_numbering of an _on_crop result (default: <raster>_crops.shp next to it).")
     parser.add_argument("--index", type=str, choices=["RGBVI", "ExG", "NDVI", "NDRE", "GNDVI"], help="Vegetation index that separates plant from soil in plant_traits (default NDVI when the raster has a near infrared band, otherwise RGBVI). NDVI, NDRE and GNDVI need a near infrared band; NDRE also a red edge band.")
     parser.add_argument("--nir_band", type=int, help="For plant_traits: number of the near infrared band (default: found from the band names, such as NIR or 840 nm).")
     parser.add_argument("--rededge_band", type=int, help="For plant_traits: number of the red edge band (default: found from the band names, such as RedEdge or 730 nm).")
@@ -288,6 +303,10 @@ if __name__ == "__main__":
     parser.add_argument("--no_resample", action="store_true", help="For plant detection: do not resample rasters finer than the model resolution (by default rasters finer than 1.1 cm per pixel are resampled to 1.5 cm).")
     parser.add_argument("--clear_cache", type=str, choices=["default", "output"], help="Delete the default cache, or the cache of the --output folder; alone it only clears, with --cli it clears before the task.")
     parser.add_argument("--json", action="store_true", help="With --cli: print a JSON summary as the last line (status, task, message, output_file, skipped, counts of plants, empty plots, fields and classes; csv_file for plant_traits). The exit code is 0 on success and 1 on error.")
+    parser.add_argument("--plant_model", type=str, help="Plant detection model (.onnx) for this run, instead of the one in File > Preferences or the default forages_rois_yolo_full_1024.onnx.")
+    parser.add_argument("--crop_model", type=str, help="Crop field model (.onnx) for this run, instead of the one in File > Preferences or the default crop_detection.onnx.")
+    parser.add_argument("--cpu", action="store_true", help="Run the models on the CPU only (default: the GPU when available, otherwise the CPU).")
+    parser.add_argument("--overwrite", action="store_true", help="When the output already exists, delete it and run the task again (default: skip the task and report skipped).")
     parser.add_argument("--download_models", action="store_true", help="Download the missing models from Hugging Face into the models folder; alone it only downloads, with --cli it downloads before the task.")
 
     args = parser.parse_args()

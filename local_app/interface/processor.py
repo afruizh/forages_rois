@@ -54,6 +54,26 @@ QGIS_STYLE = """<!DOCTYPE qgis PUBLIC 'http://mrcc.com/qgis.dtd' 'SYSTEM'>
 """
 
 
+def delete_output(path):
+    """Delete an output before running the task again: a shapefile with its parts (and the .csv
+    of plant_traits), or the dataset folder of a COCO export (<name>_coco/annotations/*.json)."""
+    import shutil
+    from custom_processor import SHAPEFILE_PARTS
+    if path.lower().endswith(".shp"):
+        base = os.path.splitext(path)[0]
+        for ext in SHAPEFILE_PARTS + (".csv",):
+            if os.path.exists(base + ext):
+                os.remove(base + ext)
+    elif path.lower().endswith(".json"):
+        dataset = os.path.dirname(os.path.dirname(path))
+        if dataset.lower().endswith("_coco"):  # never remove a folder that is not a COCO export
+            shutil.rmtree(dataset)
+        else:
+            os.remove(path)
+    else:
+        os.remove(path)
+
+
 class Processor():
 
     def __init__(self, params, progress_callback = None, interruption_check = None):
@@ -65,6 +85,19 @@ class Processor():
         # Plant detection threshold; empty means the default PLANT_CONFIDENCE
         value = self.params.get("confidence")
         return float(value) if value not in (None, "") else PLANT_CONFIDENCE
+
+    def output_exists(self, path):
+        """True when the output already exists and is kept (the task is skipped). With overwrite
+        (GUI: the answer to the question or Preferences; CLI --overwrite) the old output is deleted
+        first and the task runs again."""
+        if not path or not os.path.exists(path):
+            return False
+        if self.params.get("overwrite"):
+            delete_output(path)
+            print(f"Output already exists, overwriting: {path}")
+            return False
+        print(f"Output already exists, skipping: {path}")
+        return True
 
     def empty_plots(self):
         # Numbering with empty plots for missing plants, off by default; GUI sends empty_plots, CLI --empty_plots
@@ -132,8 +165,7 @@ class Processor():
 
             self.forages_rois_detector = ForagesROIsDetector()
             
-            if os.path.exists(output_filepath):
-                print(f"Output already exists, skipping inference: {output_filepath}")
+            if self.output_exists(output_filepath):
                 skipped = True
             else:
                 self.forages_rois_detector.tile_inference(input_file, output_filepath, progress_callback=self.progress_callback, interruption_check=self.interruption_check,
@@ -155,8 +187,7 @@ class Processor():
 
             self.forages_rois_detector = ForagesROIsDetector()
             
-            if os.path.exists(output_filepath):
-                print(f"Output already exists, skipping inference: {output_filepath}")
+            if self.output_exists(output_filepath):
                 skipped = True
             else:
                 self.forages_rois_detector.crop_inference(input_file, output_filepath, progress_callback=self.progress_callback, interruption_check=self.interruption_check)
@@ -192,8 +223,7 @@ class Processor():
 
             self.forages_rois_detector = ForagesROIsDetector()
             
-            if os.path.exists(output_filepath):
-                print(f"Output already exists, skipping inference: {output_filepath}")
+            if self.output_exists(output_filepath):
                 skipped = True
             else:
                 self.forages_rois_detector.tile_inference_on_crop(input_file, output_filepath, crop_shapefile, progress_callback=self.progress_callback, interruption_check=self.interruption_check,
@@ -217,6 +247,12 @@ class Processor():
 
             align = self.params.get("align", False)
             serpentine = self.params.get("serpentine", False)
+            # Crop fields of a tiling_detection_on_crop result: the chosen ones, else
+            # <raster>_crops.shp next to <raster>_on_crop.shp (used only if the layer has crop_id)
+            crop_shapefile = self.params.get("crop_shapefile")
+            if not crop_shapefile or not os.path.exists(crop_shapefile):
+                stem = os.path.splitext(input_file)[0]
+                crop_shapefile = (stem[:-len("_on_crop")] if stem.endswith("_on_crop") else stem) + "_crops.shp"
 
             self.forages_rois_detector = ForagesROIsDetector()
             self.forages_rois_detector.plot_numbering(input_file, output_filepath
@@ -224,7 +260,8 @@ class Processor():
                                                       , serpentine=serpentine
                                                       , start_corner=self.params.get("start_corner") or "NW"
                                                       , swap_axes=self.params.get("swap_axes", False)
-                                                      , empty_plots=self.empty_plots())
+                                                      , empty_plots=self.empty_plots()
+                                                      , crop_shapefile=crop_shapefile)
 
             results.update({"status": "completed", "message": "Task completed succesfully."})
 
@@ -247,8 +284,7 @@ class Processor():
 
             self.forages_rois_detector = ForagesROIsDetector()
             
-            if os.path.exists(output_filepath):
-                print(f"Output already exists, skipping inference: {output_filepath}")
+            if self.output_exists(output_filepath):
                 skipped = True
             else:
                 self.forages_rois_detector.plot_numbering(input_file, output_filepath
@@ -285,8 +321,7 @@ class Processor():
 
             self.forages_rois_detector = ForagesROIsDetector()
 
-            if os.path.exists(output_filepath):
-                print(f"Output already exists, skipping inference: {output_filepath}")
+            if self.output_exists(output_filepath):
                 skipped = True
             else:
                 from processing.rgb_bands import parse_bands
@@ -318,8 +353,7 @@ class Processor():
 
             self.forages_rois_detector = ForagesROIsDetector()
             
-            if os.path.exists(output_filepath):
-                print(f"Output already exists, skipping inference: {output_filepath}")
+            if self.output_exists(output_filepath):
                 skipped = True
             else:
                 self.forages_rois_detector.tile_inference(input_file, output_filepath, only=True, progress_callback=self.progress_callback, interruption_check=self.interruption_check,
@@ -379,8 +413,7 @@ class Processor():
             crop_shapefile = self.params.get("crop_shapefile") or os.path.join(
                 output_folder, os.path.splitext(os.path.basename(raster_file))[0] + "_crops.shp")
 
-            if os.path.exists(output_filepath):
-                print(f"Output already exists, skipping export: {output_filepath}")
+            if self.output_exists(output_filepath):
                 skipped = True
             else:
                 from processing.coco_export import export_coco
@@ -401,10 +434,14 @@ class Processor():
         # Report what actually happened: an existing output means nothing was run,
         # and a missing output means the task failed even if no exception was raised
         results["skipped"] = skipped
+        # Model file and device (GPU or CPU) used, for the summary and to compare models
+        detector = getattr(self, "forages_rois_detector", None)
+        if detector is not None and getattr(detector, "model_file", None):
+            results.update({"model": detector.model_file, "device": detector.device})
         if results.get("status") == "completed" and output_filepath:
             if skipped:
                 results.update({"output_file": output_filepath,
-                                "message": f"Output already exists, nothing was run:\n{output_filepath}\n\nDelete it or choose another output folder to run again."})
+                                "message": f"Output already exists, nothing was run:\n{output_filepath}\n\nOverwrite it (File > Preferences, or --overwrite on the command line) or choose another output folder to run again."})
             elif not os.path.exists(output_filepath) and task in ("tiling_detection", "tiling_detection_on_crop", "tiling_detection_only"):
                 # Detection tasks write no output when no plant is detected, usually a too coarse raster
                 pixel = raster_pixel_size_m(input_file)

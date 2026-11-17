@@ -23,7 +23,7 @@ This page is for programs that run ForagesROIs on their own: scripts, workflow t
 | `tiling_detection_on_crop` | orthomosaic | `<raster>_crops.shp` in the output folder, or `--crop_shapefile` | `<raster>_on_crop.shp` | `plant_traits` |
 | `tiling_detection` | orthomosaic | | `<raster>.shp` | `plant_traits` |
 | `tiling_detection_only` | orthomosaic | | `<raster>.shp` (not numbered) | `plot_numbering` |
-| `plot_numbering` | detections shapefile | | the input shapefile, numbered again (or the `--output` `.shp`) | `plant_traits` |
+| `plot_numbering` | detections shapefile | for an `_on_crop` result, `<raster>_crops.shp` next to it, or `--crop_shapefile` | the input shapefile, numbered again (or the `--output` `.shp`) | `plant_traits` |
 | `postprocessing` | detections shapefile | | `<input>_postprocess.shp` | `plot_numbering` |
 | `plant_traits` | numbered shapefile | `--raster` orthomosaic | `<input>_traits.shp` and `.csv` | read the CSV |
 | `export_coco` | plant boxes shapefile | `--raster` orthomosaic, optional `--crop_shapefile` | `<input>_coco/` | annotation or training tools |
@@ -38,7 +38,8 @@ Options that change results: `--confidence` (detection threshold, default 0.10),
 | `task` | The task that was run. |
 | `message` | Human readable result or error (for example "No plants were detected ... Pixel size of the raster: about 14 cm"). Show it to the user when something failed. |
 | `output_file` | The output shapefile (for `export_coco`, the `instances_default.json` of the dataset). |
-| `skipped` | `true` when the output already existed and nothing was run. |
+| `skipped` | `true` when the output already existed and nothing was run (add `--overwrite` to run again). |
+| `model`, `device` | Detection tasks: the model file used and where it ran (`GPU` or `CPU`). |
 | `counts` | Read from the output (see below). |
 | `csv_file` | For `plant_traits`: the table with one row per plot. |
 
@@ -106,7 +107,7 @@ Loop over the files and give each its own output folder, so that results and cac
 
 ## Checks before using the results
 
-- **Status:** `status` is `completed`. If `skipped` is `true`, the output is from an earlier run, possibly with other options; delete it (or use a new `--output`) when the options changed.
+- **Status:** `status` is `completed`. If `skipped` is `true`, the output is from an earlier run, possibly with other options; run again with `--overwrite` (or use a new `--output`) when the options changed.
 - **Plant count:** `counts.plants` is plausible for the trial (number of plots per field times the fields). Very few plants usually means a raster that is too coarse (the message gives its pixel size) or a scene unlike the training data.
 - **Numbering:** `counts.plants_left_out` is small compared with `counts.plants`. With `--empty_plots`, many empty plots in one field point to missed detections there.
 - **Species:** `counts.classes` matches what was planted; a species that is not in the trial points to misclassified plants.
@@ -118,7 +119,7 @@ Loop over the files and give each its own output folder, so that results and cac
 | :--- | :--- | :--- |
 | `No plants were detected` | Raster too coarse, or very unlike the training images | Use the full resolution orthomosaic (1 to 3 cm per pixel), or lower `--confidence`. |
 | `Crop shapefile not found` | `tiling_detection_on_crop` without crop fields | Run `crop_detection` with the same `--output`, or give `--crop_shapefile`. |
-| `Output already exists` | The output file is there (`skipped` is `true`) | Delete the output or use another `--output`. |
+| `Output already exists` | The output file is there (`skipped` is `true`) | Add `--overwrite`, or use another `--output`. |
 | `need the orthomosaic` or `need the plant ROIs shapefile` | `plant_traits` or `export_coco` without both inputs | Give the shapefile as `--input` and the orthomosaic as `--raster`. |
 | `cannot be computed on this raster` | `--index NDVI`, `NDRE` or `GNDVI` on an RGB raster | Use `RGBVI` or `ExG`, or give `--nir_band`. |
 | `Model not found` | The models were not downloaded | Run `ForagesROIs.exe --download_models` once. |

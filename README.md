@@ -71,6 +71,8 @@ local_app/
 │   ├── processor.py          #   runs each task in a background thread
 │   ├── raster_preview_item.py#   preview: raster, detection boxes and plant outlines
 │   ├── detection_editor.py   #   erase and add boxes, with undo
+│   ├── preferences.py        #   File > Preferences: models, GPU, existing outputs, cache folder
+│   ├── PreferencesDialog.qml #   the Preferences dialog
 │   └── batchprocessor.py     #   inference over the tiles
 ├── processing/               # processing steps without Qt
 │   ├── rgb_bands.py          #   RGB view of multiband rasters, resampling (GDAL VRT)

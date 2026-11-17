@@ -408,11 +408,12 @@ class ProcessorInterface(QObject):
         if missing:
             return "warning", f"Some models are missing in:\n{folder}\n\nTasks that need them will fail:\n" + "\n".join(
                 f"- {name}: {custom_processor.REQUIRED_MODELS[name]}" for name in missing)
-        return "ok", f"Models folder:\n{folder}\n\nAll models found."
+        from interface.preferences import models_summary
+        return "ok", f"Models folder:\n{folder}\n\nAll models found.\n{models_summary()}"
 
     @Slot(str)
     def setModelsFolder(self, folder):
-        """Use a new models folder (File > Set Models Folder). It is saved for next sessions
+        """Use a new models folder (File > Preferences). It is saved for next sessions
         unless no models are found in it."""
         import custom_processor
         from utils.app_settings import settings
@@ -426,16 +427,18 @@ class ProcessorInterface(QObject):
 
     @Slot()
     def loadModelsFolder(self):
-        """At startup: use the saved models folder if it still exists, otherwise the default one."""
+        """At startup: use the saved preferences (models folder, models, GPU) when they still exist,
+        otherwise the defaults (see preferences.apply_saved_preferences)."""
         import custom_processor
-        from utils.app_settings import settings
-        saved = settings().value("models_folder", "")
-        if saved and os.path.isdir(saved):
-            custom_processor.MODEL_PATH = saved
+        from interface.preferences import apply_saved_preferences
+        notes = apply_saved_preferences()
         level, message = self.check_models_folder(custom_processor.MODEL_PATH)
+        if notes:
+            level = "warning" if level == "ok" else level
+            message += "\n\n" + "\n\n".join(notes)
         if level != "ok":
             message += ("\n\nUse File > Download Models to download them from Hugging Face (about 100 MB), "
-                        "or File > Set Models Folder to select the folder that contains them.")
+                        "or File > Preferences to select the folder or the files.")
         print(message)
         self.modelsStatus.emit(level, custom_processor.MODEL_PATH, message)
 
@@ -455,7 +458,7 @@ class ProcessorInterface(QObject):
     @Slot()
     def downloadModels(self):
         """Download the missing models into the models folder (File > Download Models). When it ends,
-        the folder is checked and saved like with Set Models Folder; errors go to the error dialog."""
+        the folder is checked and saved like the models folder in Preferences; errors go to the error dialog."""
         import custom_processor
         if getattr(self, "worker", None) is not None and self.worker.isRunning():
             self.finished.emit({"status": "error", "message": "Wait until the current task ends before downloading the models."})

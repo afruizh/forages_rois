@@ -19,8 +19,9 @@ from interface.batchprocessor import BatchProcessor
 import glob
 
 # Default models folder: "models" next to the script or the executable (not the working directory).
-# The GUI can change it with File > Set Models Folder (see ProcessorInterface.setModelsFolder).
+# The models folder and each model file can be changed in File > Preferences (see interface/preferences.py).
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "models")
+DEFAULT_MODEL_PATH = MODEL_PATH  # kept when MODEL_PATH is changed, for Restore Defaults
 #MODEL_PATH = r"\\CATALOGUE.CGIARAD.ORG\AcceleratedBreedingInitiative\1.Data\36. Dataset ROI\models"
 
 MODEL_FILENAME = "forages_rois_yolo_full_1024.onnx"
@@ -45,9 +46,79 @@ REQUIRED_MODELS = {
     CROP_MODEL_FILENAME: "crop field detection (crop_detection)",
 }
 
+# Models chosen in File > Preferences (or --plant_model, --crop_model for one run): full path of the
+# file used instead of the default one in MODEL_PATH, or None for the default
+CUSTOM_MODELS = {MODEL_FILENAME: None, CROP_MODEL_FILENAME: None}
+# GPU (CUDA) when available, otherwise CPU; False runs on the CPU only (Preferences, --cpu)
+USE_GPU = True
+
+
+def model_path(model_filename):
+    """File used for a model: the one chosen in Preferences, otherwise the default in MODEL_PATH."""
+    return CUSTOM_MODELS.get(model_filename) or os.path.join(MODEL_PATH, model_filename)
+
+
+def execution_providers():
+    """onnxruntime providers: CUDA first when USE_GPU and onnxruntime was built with it; onnxruntime
+    falls back to the CPU by itself when CUDA cannot start (driver, missing DLLs)."""
+    if USE_GPU and "CUDAExecutionProvider" in ort.get_available_providers():
+        return [("CUDAExecutionProvider", {"device_id": 0}), "CPUExecutionProvider"]
+    return ["CPUExecutionProvider"]
+
+
+def check_model(path, model_filename):
+    """Check that a model file can be used for model_filename (plant or crop model). Returns
+    (level, text): "ok", "warning" (usable, but check the text) or "error" (cannot be used)."""
+    import ast
+    if not path or not os.path.isfile(path):
+        return "error", f"File not found: {path}"
+    try:
+        sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+    except Exception as e:
+        return "error", f"onnxruntime {ort.__version__} cannot load it: {e}"
+    plant = model_filename == MODEL_FILENAME
+    size = 1024 if plant else 640
+    inp, outs = sess.get_inputs()[0], sess.get_outputs()
+    meta = sess.get_modelmeta().custom_metadata_map
+    try:
+        names = ast.literal_eval(meta.get("names", "{}"))
+    except (ValueError, SyntaxError):
+        names = {}
+    # Only what makes a model compliant: computer vision task, input size and classes
+    task = meta.get("task") or ("segment" if len(outs) >= 2 else "detect")
+    if len(inp.shape) == 4 and isinstance(inp.shape[2], int):
+        model_size = inp.shape[2]
+    else:  # dynamic input: the size it was exported at, if recorded
+        try:
+            model_size = int(ast.literal_eval(meta.get("imgsz", "[0]"))[0]) or None
+        except (ValueError, SyntaxError, TypeError, IndexError):
+            model_size = None
+    text = [f"Task: {task} (required: {'detect' if plant else 'segment'})",
+            f"Input size: {f'{model_size} px' if model_size else 'any'} (required: {size} px)",
+            "Classes: " + (", ".join(f"{k} {v}" for k, v in sorted(names.items())) if names else "not recorded")]
+    if inp.name != "images" or len(inp.shape) != 4:
+        return "error", "\n".join(text + ["The input must be an image (images, 3 channels)."])
+    if not plant and len(outs) < 2:
+        return "error", "\n".join(text + ["The crop field model must be a segmentation model."])
+    warnings = []
+    if plant and task != "detect":
+        warnings.append("The plant model should be a detection model.")
+    if model_size and model_size != size:
+        warnings.append(f"The input size differs: the app sends {size} px.")
+    expected = PLANT_CLASS_NAMES if plant else CROP_CLASS_NAMES
+    if names and len(names) != len(expected):
+        warnings.append("The classes differ: required " + ", ".join(f"{k} {v}" for k, v in expected.items()) + ".")
+    elif names and any(str(names.get(k, "")).lower() != v for k, v in expected.items()):
+        warnings.append("The class names differ: required " + ", ".join(f"{k} {v}" for k, v in expected.items())
+                        + ", in this order.")
+    return ("warning" if warnings else "ok"), "\n".join(text + warnings)
+
+
 def missing_models(folder):
-    """Return the required model files that are not in folder."""
-    return [name for name in REQUIRED_MODELS if not os.path.isfile(os.path.join(folder, name))]
+    """Return the required model files that are not in folder (models chosen in Preferences
+    elsewhere do not count as missing)."""
+    return [name for name in REQUIRED_MODELS
+            if not CUSTOM_MODELS.get(name) and not os.path.isfile(os.path.join(folder, name))]
 
 # The same models on Hugging Face (AGPL-3.0), fixed to the version of this release by its tag,
 # with the SHA256 of each file so that a broken or different download is never used
@@ -92,7 +163,7 @@ def download_models(folder, names=None, progress_callback=None, interruption_che
                 os.remove(part)
             raise OSError(f"Could not download {name} from\n{MODELS_URL + name}\n\n{e}\n\n"
                           "Check the internet connection, or download the models by hand and select "
-                          "their folder with File > Set Models Folder.") from e
+                          "their folder in File > Preferences.") from e
         if sha.hexdigest() != MODEL_SHA256[name]:
             os.remove(part)
             raise ValueError(f"The downloaded {name} does not match the expected checksum and was deleted. Try again.")
@@ -116,11 +187,11 @@ def replace_shapefile(src_shp, dst_shp):
 def model_stamp(model_filename=MODEL_FILENAME):
     """Name, size and modification time of a model file, for cache keys: replacing the model
     in the models folder then gives new detections instead of the cached ones."""
-    path = os.path.join(MODEL_PATH, model_filename)
+    path = model_path(model_filename)
     if not os.path.exists(path):
-        return model_filename
+        return path
     st = os.stat(path)
-    return f"{model_filename}:{st.st_size}:{int(st.st_mtime)}"
+    return f"{path}:{st.st_size}:{int(st.st_mtime)}"
 
 
 def preprocess(np_img, imgsz=1024, pad_color=114, debug_path=None):
@@ -1152,11 +1223,33 @@ def rotate_polygon_to_pca_axes(polygon, centroid, axes):
     return Polygon(rotated_coords)
 
 # --- Main pipeline ---
+def read_crop_polygons(crop_shp):
+    """Crop field polygons in file order; crop_id k is polygon k - 1. From crop_detection only class 0
+    (crop): the model's class 1, target, is not a field; files drawn by the user without a class field
+    are used whole."""
+    from osgeo import ogr
+    import shapely.wkt
+    crop_polys = []
+    ds_crop = ogr.Open(crop_shp) if crop_shp and os.path.exists(crop_shp) else None
+    if ds_crop:
+        layer_crop = ds_crop.GetLayer()
+        class_index = layer_crop.GetLayerDefn().GetFieldIndex("class")
+        for feat in layer_crop:
+            geom = feat.GetGeometryRef()
+            if class_index >= 0 and feat.GetField(class_index) not in (0, None):
+                continue
+            if geom:
+                crop_polys.append(shapely.wkt.loads(geom.ExportToWkt()))
+        ds_crop = None
+    return crop_polys
+
 def label_polygons_from_shapefile(input_shp, output_shp, serpentine=False, row_tol=10,
                                    iou_thresh=0.3, min_ratio=0.2, max_ratio=5.0, align_to_grid=False, only_postprocess=False,
-                                   start_corner="NW", swap_axes=False, empty_plots=False):
+                                   start_corner="NW", swap_axes=False, empty_plots=False, crop_polys=None):
     # row_tol and align_to_grid are kept for compatibility; numbering now uses assign_grid_ids()
     # empty_plots: add an empty plot (status "empty") for each planting position without a plant
+    # crop_polys: crop field polygons (read_crop_polygons) of a layer with crop_id; with them the empty
+    # plots at the row ends are added only inside the field, as tiling_detection_on_crop does
     from osgeo import ogr, osr
     import shapely.wkt
     import shapely.geometry
@@ -1200,11 +1293,18 @@ def label_polygons_from_shapefile(input_shp, output_shp, serpentine=False, row_t
         rows = np.zeros(len(polys), dtype=int)
         cols = np.zeros(len(polys), dtype=int)
         n_plants = len(wkt_list)
+        # Field polygons only when they match the crop_id values (crop_id k is polygon k - 1)
+        known = [c for c in crop_ids if c]
+        if not crop_polys or not known or max(known) > len(crop_polys):
+            crop_polys = None
         for crop in np.unique(crop_ids[:n_plants]):
             members = np.flatnonzero(np.array(crop_ids[:n_plants]) == crop)
+            inside = None
+            if crop_polys and crop:
+                inside = lambda x, y, poly=crop_polys[int(crop) - 1]: poly.contains(shapely.geometry.Point(x, y))
             grid_ids[members], rows[members], cols[members], empty = assign_grid_ids(
                 centroids[members], srs, serpentine=serpentine, start_corner=start_corner, swap_axes=swap_axes,
-                empty_plots=empty_plots)
+                empty_plots=empty_plots, inside=inside)
             # Empty plots: box of the median plant size, no score or class
             for (x, y, g, r, c), wkt in zip(empty, empty_plot_wkt(empty, [polys[i] for i in members])):
                 fields = [None] * field_count
@@ -1516,28 +1616,26 @@ class ForagesROIsDetector():
     def initialize(self, model_filename=MODEL_FILENAME):
 
         #Load model
-        if self.ort_sess is None or getattr(self, "current_model_filename", None) != model_filename:
+        model_filepath = model_path(model_filename)
+        if self.ort_sess is None or getattr(self, "current_model_file", None) != model_filepath:
 
-            model_filepath = os.path.join(MODEL_PATH, model_filename)
             if not os.path.exists(model_filepath):
                 raise FileNotFoundError(f"Model not found:\n{model_filepath}\n\n"
-                                        "Set the folder that contains the models in File > Set Models Folder, "
+                                        "Choose the models in File > Preferences, "
                                         "or download them with File > Download Models "
                                         "(command line: add --download_models).")
 
-            providers = [
-                ("CUDAExecutionProvider", {
-                    "device_id": 0,
-                    # Optional: additional options can be provided, e.g.
-                    #"gpu_mem_limit":  * 1024 * 1024 * 1024,
-                    #"gpu_mem_limit":  6 * 1024,
-                    # "cudnn_conv_algo_search": "EXHAUSTIVE",
-                    # "do_copy_in_default_stream": True,
-                })
-            ]
-
-            self.ort_sess = ort.InferenceSession(model_filepath, providers=providers)
-            self.current_model_filename = model_filename
+            # GPU (CUDA) when available, otherwise CPU (see execution_providers)
+            self.ort_sess = ort.InferenceSession(model_filepath, providers=execution_providers())
+            self.current_model_file = model_filepath
+            self.model_file = model_filepath
+            self.device = "GPU" if "CUDAExecutionProvider" in self.ort_sess.get_providers() else "CPU"
+            print(f"Model {model_filepath} on the {self.device}")
+            try:
+                from utils.app_settings import settings
+                settings().setValue("last_device", self.device)  # shown in Preferences
+            except Exception:
+                pass
 
             # self.ort_sess = ort.InferenceSession(model_filepath
             #                     ,providers=ort.get_available_providers()
@@ -1821,7 +1919,9 @@ class ForagesROIsDetector():
             print("No shapefiles found to merge in", shp_dir)
 
     def plot_numbering(self, input_filepath, output_filepath, serpentine=True, align_to_grid=False, only_postprocess=False,
-                       start_corner="NW", swap_axes=False, empty_plots=False):
+                       start_corner="NW", swap_axes=False, empty_plots=False, crop_shapefile=None):
+        # crop_shapefile: the crop fields of a tiling_detection_on_crop result, so that renumbering adds
+        # the same empty plots at the row ends (inside each field) as the first run
         safe_input_filepath = os.path.normpath(input_filepath)
         safe_input_output_filepath = os.path.normpath(output_filepath)
         # Output may be the input itself (numbering written into the shown shapefile, like the
@@ -1832,7 +1932,8 @@ class ForagesROIsDetector():
 
         # Post process the merged shapefile
         label_polygons_from_shapefile(safe_input_filepath, safe_input_output_filepath, serpentine=serpentine, row_tol=1.0, min_ratio=1/1.8, max_ratio=1.8, iou_thresh=ROI_NMS_IOU, align_to_grid=align_to_grid, only_postprocess=only_postprocess,
-                                      start_corner=start_corner, swap_axes=swap_axes, empty_plots=empty_plots)
+                                      start_corner=start_corner, swap_axes=swap_axes, empty_plots=empty_plots,
+                                      crop_polys=read_crop_polygons(crop_shapefile))
 
         if in_place:
             replace_shapefile(safe_input_output_filepath, safe_input_filepath)
@@ -1912,20 +2013,7 @@ def label_polygons_from_shapefile_by_crop(input_shp, output_shp, crop_shp, serpe
     layer_in = ds_in.GetLayer()
     srs = layer_in.GetSpatialRef()
     
-    # Load crop polygons (from crop_detection only class 0, crop: the model's class 1, target,
-    # is not a field; files drawn by the user without a class field are used whole)
-    ds_crop = driver.Open(crop_shp)
-    crop_polys = []
-    if ds_crop:
-        layer_crop = ds_crop.GetLayer()
-        class_index = layer_crop.GetLayerDefn().GetFieldIndex("class")
-        for feat in layer_crop:
-            geom = feat.GetGeometryRef()
-            if class_index >= 0 and feat.GetField(class_index) not in (0, None):
-                continue
-            if geom:
-                crop_polys.append(shapely.wkt.loads(geom.ExportToWkt()))
-        ds_crop = None
+    crop_polys = read_crop_polygons(crop_shp)
 
     # Load plants
     plants = []

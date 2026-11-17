@@ -26,7 +26,7 @@ The tasks then work on an 8 bit RGB view of the chosen bands, each stretched fro
 
 **Note:** the models were trained on RGB camera images. A colour image made from the narrow red, green and blue bands of a multispectral camera looks slightly different, so check the detections on your first flights.
 
-Press **Run Inference** to start and **Cancel** to stop. A message tells you when the task ends, and **Open** in that message opens the output folder. If the output file already exists, nothing is run: delete it or choose another output folder.
+Press **Run Inference** to start and **Cancel** to stop. A message tells you when the task ends, and **Open** in that message opens the output folder. If the output already exists, the application asks: **Overwrite** deletes it (with any edits saved in it) and runs the task again, **Keep It** leaves it as it is. **Don't ask again** saves the answer in **File > Preferences**.
 
 ## Tasks
 
@@ -36,7 +36,7 @@ Press **Run Inference** to start and **Cancel** to stop. A message tells you whe
 | `tiling_detection_on_crop` | raster and crop fields | `<raster>_on_crop.shp` | Detects plants inside the fields and numbers each field separately. Recommended. |
 | `tiling_detection` | raster | `<raster>.shp` | Detects plants on the whole orthomosaic and numbers them. |
 | `tiling_detection_only` | raster | `<raster>.shp` | Detects plants without numbering. |
-| `plot_numbering` | detections shapefile | the same shapefile | Numbers again an existing result with other options, without running the detection again. The new numbers are written into the input shapefile, like the edits; unsaved edits are saved first. |
+| `plot_numbering` | detections shapefile | the same shapefile | Numbers again an existing result with other options, without running the detection again. The new numbers are written into the input shapefile, like the edits; unsaved edits are saved first. For an `_on_crop` result, the crop fields (`<raster>_crops.shp` next to it, or **Crop Shapefile**) limit the empty plots at the row ends to each field, as in the first run. |
 | `postprocessing` | detections shapefile | `<input>_postprocess.shp` | Removes duplicated and badly shaped boxes, without numbering. |
 | `plant_traits` | raster and numbered shapefile | `<input>_traits.shp` and `.csv` | Canopy outline, area and cover of each plant. |
 | `export_coco` | raster and plant boxes shapefile | `<input>_coco/` | Exports the boxes as a COCO dataset of 1024 px RGB tiles, to annotate further or retrain (see [Outputs](outputs.md)). |
@@ -94,13 +94,20 @@ When a task ends, its output is put where the next task reads it: the crop field
 ## Menus
 
 - **File > New** (`Ctrl+N`): starts again with an empty preview. It clears the raster, the detections and outlines shown, and **Input Raster**, **Input Shapefile** and **Crop Shapefile**; the **Output Folder**, the task and the options are kept, and no file is deleted. If there are erased or added boxes not saved yet, it asks first: **Save** writes them into the shapefile, **Discard** drops them, **Cancel** keeps everything as it was. It is disabled while a task runs.
-- **File > Set Models Folder...**: choose the folder that contains the models (`.onnx`). The application checks it and remembers it. By default it uses the `models` folder next to the executable.
 - **File > Download Models**: downloads the missing models from [Hugging Face](https://huggingface.co/anfruizhu/forages-rois-models) (about 100 MB) into the models folder, checks them and starts using them. The progress is shown in the status bar and **Cancel** stops it. If models are missing when the application starts, it offers to download them. If the models folder cannot be written, they go to a `models` folder in your application data.
 - **File > Cache**: the application keeps temporary files (tiles, detections, previews and RGB views) so that a second run is faster.
   - With an output folder they go to `.cache_forages_rois` inside it. Before an output folder is chosen they go to the **default cache**, `%LOCALAPPDATA%\ForagesROIs\cache`. Nothing is written next to the input raster.
   - **Open Default Cache Folder** and **Open Output Folder Cache** open them in the file explorer.
-  - **Set Default Cache Folder...** moves the default cache (a `.cache_forages_rois` folder is made inside the folder you choose), for example to another disk.
   - **Clear Default Cache** and **Clear Output Folder Cache** show their size and delete them after asking. The results in the output folder are kept.
+- **File > Preferences...** (`Ctrl+,`): settings kept between sessions. Changes apply with **OK** or **Apply**; **Cancel** discards them, and **Restore Defaults** resets the open tab.
+  - **Models** tab:
+    - **Models folder**, where the default models are read and downloaded (by default `models` next to the executable), with **Download Models**.
+    - **Plant detection model** and **Crop field model**: the default file, or another `.onnx` chosen with **Browse...** (any name, any folder) to try a different model. Each model is checked when chosen: input, output and classes, with a warning when, for example, its classes are not urochloa and megathyrsus in this order.
+    - **Processing device**: **GPU (CUDA) when available, otherwise CPU** (default) or **CPU only**. The line below says whether this build can use the GPU and where the last model ran.
+  - **Processing** tab:
+    - **When the output already exists**: **Ask** (default), **Skip** (keep it and run nothing) or **Overwrite**.
+    - **Default cache folder**, used without an output folder, with **Clear Default Cache**.
+- The models and the device in use are shown under **Task**; click that line to open Preferences.
 - **Help > About**: version and credits.
 
 ## From QGIS
@@ -111,4 +118,4 @@ With the ForagesROIs launcher plugin, right click an orthomosaic layer and choos
 
 - **No plants were detected, so no output was created**: usually the orthomosaic is too coarse. The message shows its pixel size; use the full resolution orthomosaic (1 to 3 cm per pixel) or lower the confidence.
 - **Error: Crop shapefile not found**: run `crop_detection` first, or choose a crop shapefile.
-- **Output already exists, nothing was run**: delete the output or choose another output folder.
+- **Output already exists, nothing was run**: shown when **When the output already exists** is **Skip**. Choose **Overwrite** or **Ask** in **File > Preferences**, or another output folder.
